@@ -1,0 +1,10 @@
+{
+    "python.analysis.include": [
+        "ai_c_test_generator"
+    ],
+    "python.analysis.exclude": [
+        "**/node_modules",
+        "**/__pycache__",
+        "**/.*"
+    ]
+}
