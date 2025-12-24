@@ -22,6 +22,7 @@ class TestValidator:
         """
         validation_result = {
             'file': os.path.basename(test_file_path),
+            'test_file': test_file_path,
             'compiles': True,
             'realistic': True,
             'quality': 'High',
@@ -38,21 +39,25 @@ class TestValidator:
             with open(source_file_path, 'r') as f:
                 source_content = f.read()
 
+            # Detect framework
+            is_gtest = '#include <gtest/gtest.h>' in test_content or '#include "gtest/gtest.h"' in test_content
+            is_unity = '#include "unity.h"' in test_content or '#include <unity.h>' in test_content
+
             # Extract source function signatures
             source_functions = self.analyzer._extract_functions(source_file_path)
             source_includes = self.analyzer._extract_includes(source_file_path)
 
             # 1. COMPILATION SAFETY CHECKS
-            self._check_compilation_safety(test_content, source_functions, source_includes, validation_result)
+            self._check_compilation_safety(test_content, source_functions, source_includes, validation_result, is_gtest)
 
             # 2. REALITY CHECKS
-            self._check_reality_tests(test_content, source_functions, validation_result)
+            self._check_reality_tests(test_content, source_functions, validation_result, is_gtest)
 
             # 3. TEST QUALITY ASSESSMENT
-            self._assess_test_quality(test_content, source_functions, validation_result)
+            self._assess_test_quality(test_content, source_functions, validation_result, is_gtest)
 
             # 4. LOGICAL CONSISTENCY VERIFICATION
-            self._verify_logical_consistency(test_content, validation_result)
+            self._verify_logical_consistency(test_content, validation_result, is_gtest)
 
             # 5. EMBEDDED HARDWARE VALIDATION
             self._check_embedded_features(test_content, source_content, validation_result)
@@ -67,7 +72,7 @@ class TestValidator:
 
         return validation_result
 
-    def _check_compilation_safety(self, test_content: str, source_functions: List[Dict], source_includes: List[str], result: Dict):
+    def _check_compilation_safety(self, test_content: str, source_functions: List[Dict], source_includes: List[str], result: Dict, is_gtest: bool = False):
         """Check compilation safety criteria"""
 
         # Check for markdown markers (should be removed by post-processing)
@@ -76,30 +81,41 @@ class TestValidator:
             result['compiles'] = False
 
         # Check for required includes
-        required_includes = ['unity.h'] + [f"{func['name']}.h" for func in source_functions if func['name'] != 'main']
+        if is_gtest:
+            required_includes = ['gtest/gtest.h']
+            # For C++ GTest, we might not need to include the source header if we are testing a .cpp file directly
+            # or if the source code is embedded in the test file (which is common for single-file generation)
+        else:
+            required_includes = ['unity.h'] + [f"{func['name']}.h" for func in source_functions if func['name'] != 'main']
+
         for include in required_includes:
             if f'#include "{include}"' not in test_content and f'#include <{include}>' not in test_content:
                 if include == 'unity.h':
                     result['issues'].append(f"Missing required Unity include: #include \"unity.h\"")
+                    result['compiles'] = False
+                elif include == 'gtest/gtest.h':
+                    result['issues'].append(f"Missing required Google Test include: #include <gtest/gtest.h>")
                     result['compiles'] = False
 
         # Check for invalid includes (headers that don't exist)
         invalid_includes = []
         include_pattern = re.compile(r'#include\s+["<]([^">]+)[">]')
         # Common standard C library headers that are acceptable in tests
-        standard_headers = {'stdio.h', 'stdlib.h', 'string.h', 'math.h', 'assert.h', 'ctype.h', 'errno.h', 'limits.h', 'stdarg.h', 'stddef.h', 'stdint.h', 'stdbool.h', 'time.h'}
+        standard_headers = {'stdio.h', 'stdlib.h', 'string.h', 'math.h', 'assert.h', 'ctype.h', 'errno.h', 'limits.h', 'stdarg.h', 'stddef.h', 'stdint.h', 'stdbool.h', 'time.h', 'iostream', 'string', 'vector', 'map', 'algorithm'}
         
         for match in include_pattern.finditer(test_content):
             header = match.group(1)
-            # Allow unity.h, standard library headers, and headers from source
-            if header != 'unity.h' and header not in standard_headers and header not in source_includes:
+            # Allow unity.h, gtest, standard library headers, and headers from source
+            if header != 'unity.h' and header != 'gtest/gtest.h' and header != 'gmock/gmock.h' and header not in standard_headers and header not in source_includes:
                 # Check if it's a valid header file that should exist
                 if not any(header in inc for inc in source_includes):
                     invalid_includes.append(header)
 
         if invalid_includes:
-            result['issues'].append(f"Invalid includes for non-existent headers: {invalid_includes}")
-            result['compiles'] = False
+            # For GTest/C++, we might be more lenient with includes if they look like standard C++ headers
+            if not is_gtest:
+                result['issues'].append(f"Invalid includes for non-existent headers: {invalid_includes}")
+                result['compiles'] = False
 
         # Check function signature matches
         test_functions = self._extract_test_functions(test_content)
@@ -127,17 +143,22 @@ class TestValidator:
         if main_calls:
             # Allow main() testing if it's declared as extern and called like a regular function
             # This is acceptable for simple main functions that don't have complex setup
-            if not re.search(r'extern\s+int\s+main\s*\(\s*void\s*\)\s*;', test_content):
+            # Allow both 'extern int main(void);' and 'extern int main();'
+            if not re.search(r'extern\s+int\s+main\s*\(\s*(?:void)?\s*\)\s*;', test_content):
                 result['issues'].append("Invalid call to main() function - not suitable for unit testing")
                 result['compiles'] = False
 
-    def _check_reality_tests(self, test_content: str, source_functions: List[Dict], result: Dict):
+    def _check_reality_tests(self, test_content: str, source_functions: List[Dict], result: Dict, is_gtest: bool = False):
         """Validate reality checks"""
 
         # Check for invalid floating point assertions
-        if 'TEST_ASSERT_EQUAL_FLOAT' in test_content:
+        if not is_gtest and 'TEST_ASSERT_EQUAL_FLOAT' in test_content:
             result['issues'].append("TEST_ASSERT_EQUAL_FLOAT used - will fail due to precision. Use TEST_ASSERT_FLOAT_WITHIN instead")
             result['realistic'] = False
+        
+        if is_gtest and 'ASSERT_FLOAT_EQ' in test_content and 'EXPECT_NEAR' not in test_content:
+             # GTest ASSERT_FLOAT_EQ is generally okay, but EXPECT_NEAR is better for embedded
+             pass
 
         # Check for impossible test values
         impossible_patterns = [
@@ -154,13 +175,14 @@ class TestValidator:
                     result['realistic'] = False
 
         # Check floating point comparisons have tolerance - only for actual assertions
-        float_assertions = re.findall(r'TEST_ASSERT_FLOAT_WITHIN\s*\([^)]+\)', test_content)
-        float_equal_assertions = re.findall(r'TEST_ASSERT_EQUAL_FLOAT\s*\([^)]+\)', test_content)
+        if not is_gtest:
+            float_assertions = re.findall(r'TEST_ASSERT_FLOAT_WITHIN\s*\([^)]+\)', test_content)
+            float_equal_assertions = re.findall(r'TEST_ASSERT_EQUAL_FLOAT\s*\([^)]+\)', test_content)
 
-        # Only flag if there are float equality assertions without tolerance
-        if float_equal_assertions and not float_assertions:
-            result['issues'].append("TEST_ASSERT_EQUAL_FLOAT used - will fail due to precision. Use TEST_ASSERT_FLOAT_WITHIN instead")
-            result['realistic'] = False
+            # Only flag if there are float equality assertions without tolerance
+            if float_equal_assertions and not float_assertions:
+                result['issues'].append("TEST_ASSERT_EQUAL_FLOAT used - will fail due to precision. Use TEST_ASSERT_FLOAT_WITHIN instead")
+                result['realistic'] = False
 
         # Check stub return types match expected ranges - be more specific about context
         if 'temperature' in test_content.lower() or 'celsius' in test_content.lower():
@@ -169,6 +191,7 @@ class TestValidator:
             temp_assignment_patterns = [
                 r'return_value\s*=\s*(\d+\.?\d*)f?',  # stub return values
                 r'TEST_ASSERT_FLOAT_WITHIN\s*\([^,]+,\s*(\d+\.?\d*)f?',  # float assertions
+                r'EXPECT_NEAR\s*\([^,]+,\s*(\d+\.?\d*)f?', # GTest float assertions
                 r'(\d+\.?\d*)f?\s*,\s*temp',  # temperature parameters
             ]
 
@@ -191,19 +214,26 @@ class TestValidator:
 
                         # Validate temperature ranges
                         if temp > 200.0:  # Definitely too high for temperature
-                            result['issues'].append(f"Temperature value {temp} seems unreasonably high (valid range: -40°C to 125°C)")
+                            result['issues'].append(f"Temperature value {temp} seems unreasonably high (valid range: -40C to 125C)")
                             result['realistic'] = False
                         elif temp < -100.0:  # Definitely too low for temperature
-                            result['issues'].append(f"Temperature value {temp} seems unreasonably low (valid range: -40°C to 125°C)")
+                            result['issues'].append(f"Temperature value {temp} seems unreasonably low (valid range: -40C to 125C)")
                             result['realistic'] = False
                     except ValueError:
                         pass
 
-    def _assess_test_quality(self, test_content: str, source_functions: List[Dict], result: Dict):
+    def _assess_test_quality(self, test_content: str, source_functions: List[Dict], result: Dict, is_gtest: bool = False):
         """Assess test quality criteria"""
 
         test_functions = self._extract_test_functions(test_content)
-        test_names = [f['name'] for f in test_functions if f['name'].startswith('test_')]
+        
+        if is_gtest:
+            # For GTest, look for TEST() and TEST_F() macros
+            test_names = re.findall(r'TEST(?:_F)?\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)', test_content)
+            # Flatten to just test names
+            test_names = [f"{suite}_{name}" for suite, name in test_names]
+        else:
+            test_names = [f['name'] for f in test_functions if f['name'].startswith('test_')]
 
         # Check for edge cases
         edge_case_indicators = ['min', 'max', 'zero', 'negative', 'boundary', 'edge', 'limit']
@@ -217,8 +247,12 @@ class TestValidator:
         has_error_tests = any(any(indicator in name.lower() for indicator in error_indicators) for name in test_names)
 
         # Check setUp/tearDown usage
-        has_setup = 'setUp(' in test_content
-        has_teardown = 'tearDown(' in test_content
+        if is_gtest:
+            has_setup = 'SetUp' in test_content
+            has_teardown = 'TearDown' in test_content
+        else:
+            has_setup = 'setUp(' in test_content
+            has_teardown = 'tearDown(' in test_content
 
         if has_setup and has_teardown:
             # Check if there are stub variables that need resetting
@@ -229,7 +263,11 @@ class TestValidator:
                 # Verify stubs are reset - check for either reset functions or direct variable resets
                 has_reset_functions = 'reset_' in test_content
                 # Check for direct variable resets in tearDown (e.g., var_name = 0)
-                teardown_section = re.search(r'void tearDown\(void\)\s*{([^}]*)}', test_content, re.DOTALL)
+                if is_gtest:
+                    teardown_section = re.search(r'void TearDown\(\)\s*(?:override)?\s*{([^}]*)}', test_content, re.DOTALL)
+                else:
+                    teardown_section = re.search(r'void tearDown\(void\)\s*{([^}]*)}', test_content, re.DOTALL)
+                
                 has_direct_resets = False
                 if teardown_section:
                     teardown_content = teardown_section.group(1)
@@ -241,7 +279,10 @@ class TestValidator:
 
         # Check for meaningful test content
         if len(test_names) == 0:
-            result['issues'].append("No test functions found (functions should start with 'test_')")
+            if is_gtest:
+                result['issues'].append("No Google Test macros found (TEST or TEST_F)")
+            else:
+                result['issues'].append("No test functions found (functions should start with 'test_')")
 
         # Check for test isolation (each test should be independent)
         if has_setup and has_teardown:
@@ -250,24 +291,34 @@ class TestValidator:
         elif len(test_names) > 1:
             result['issues'].append("Multiple tests without setUp/tearDown - may not be properly isolated")
 
-    def _verify_logical_consistency(self, test_content: str, result: Dict):
+    def _verify_logical_consistency(self, test_content: str, result: Dict, is_gtest: bool = False):
         """Verify logical consistency"""
 
         # Check for contradictory assertions in the same test
-        test_sections = re.split(r'void test_\w+\s*\(', test_content)[1:]  # Split by test functions
+        if is_gtest:
+             test_sections = re.split(r'TEST(?:_F)?\s*\([^)]+\)\s*\{', test_content)[1:]
+        else:
+             test_sections = re.split(r'void test_\w+\s*\(', test_content)[1:]  # Split by test functions
 
         for i, section in enumerate(test_sections):
             test_name = f"test_{i+1}"  # Approximate name
-            assertions = re.findall(r'TEST_ASSERT_\w+\s*\([^)]+\)', section)
-
-            # Check for contradictory boolean assertions
-            true_asserts = [a for a in assertions if 'TEST_ASSERT_TRUE' in a]
-            false_asserts = [a for a in assertions if 'TEST_ASSERT_FALSE' in a]
+            if is_gtest:
+                assertions = re.findall(r'(?:EXPECT|ASSERT)_\w+\s*\([^)]+\)', section)
+                true_asserts = [a for a in assertions if 'TRUE' in a]
+                false_asserts = [a for a in assertions if 'FALSE' in a]
+            else:
+                assertions = re.findall(r'TEST_ASSERT_\w+\s*\([^)]+\)', section)
+                true_asserts = [a for a in assertions if 'TEST_ASSERT_TRUE' in a]
+                false_asserts = [a for a in assertions if 'TEST_ASSERT_FALSE' in a]
 
             if true_asserts and false_asserts:
                 # Check if they're testing different variables
-                true_vars = [re.search(r'TEST_ASSERT_TRUE\s*\(\s*([^)]+)', a) for a in true_asserts]
-                false_vars = [re.search(r'TEST_ASSERT_FALSE\s*\(\s*([^)]+)', a) for a in false_asserts]
+                if is_gtest:
+                    true_vars = [re.search(r'(?:EXPECT|ASSERT)_TRUE\s*\(\s*([^)]+)', a) for a in true_asserts]
+                    false_vars = [re.search(r'(?:EXPECT|ASSERT)_FALSE\s*\(\s*([^)]+)', a) for a in false_asserts]
+                else:
+                    true_vars = [re.search(r'TEST_ASSERT_TRUE\s*\(\s*([^)]+)', a) for a in true_asserts]
+                    false_vars = [re.search(r'TEST_ASSERT_FALSE\s*\(\s*([^)]+)', a) for a in false_asserts]
 
                 if true_vars and false_vars:
                     true_var_names = [match.group(1).strip() if match else "" for match in true_vars]
@@ -279,14 +330,18 @@ class TestValidator:
                         result['issues'].append(f"Test {test_name}: contradictory assertions for variables {common_vars}")
 
         # Check for reasonable assertion values
-        equal_assertions = re.findall(r'TEST_ASSERT_EQUAL\s*\(\s*([^,]+)\s*,\s*([^)]+)\s*\)', test_content)
+        if is_gtest:
+            equal_assertions = re.findall(r'(?:EXPECT|ASSERT)_EQ\s*\(\s*([^,]+)\s*,\s*([^)]+)\s*\)', test_content)
+        else:
+            equal_assertions = re.findall(r'TEST_ASSERT_EQUAL\s*\(\s*([^,]+)\s*,\s*([^)]+)\s*\)', test_content)
+            
         for expected, actual in equal_assertions:
             # Check for obviously wrong assertions like TEST_ASSERT_EQUAL(1, 2)
             try:
                 exp_val = int(expected.strip())
                 act_val = int(actual.strip())
                 if exp_val != act_val and abs(exp_val - act_val) > 1000:  # Large difference
-                    result['issues'].append(f"Unreasonable assertion: TEST_ASSERT_EQUAL({exp_val}, {act_val})")
+                    result['issues'].append(f"Unreasonable assertion: ({exp_val}, {act_val})")
             except (ValueError, AttributeError):
                 pass  # Not simple integers, skip
 
@@ -372,24 +427,38 @@ class TestValidator:
     def _extract_test_functions(self, content: str) -> List[Dict]:
         """Extract test function definitions from test content"""
         functions = []
-        # Match function definitions
+        
+        # Match standard C function definitions
         func_pattern = r'(\w+)\s+(\w+)\s*\([^)]*\)\s*{'
         matches = re.findall(func_pattern, content)
 
         for return_type, func_name in matches:
+            # Skip GTest macros which look like functions but aren't standard C functions
+            if func_name in ['TEST', 'TEST_F', 'TEST_P']:
+                continue
             functions.append({
                 'name': func_name,
                 'return_type': return_type
+            })
+            
+        # Match GTest macros to extract test names
+        gtest_pattern = r'(TEST(?:_F|_P)?)\s*\(\s*(\w+)\s*,\s*(\w+)\s*\)'
+        gtest_matches = re.findall(gtest_pattern, content)
+        
+        for macro, suite, name in gtest_matches:
+            functions.append({
+                'name': f"{suite}_{name}", # Combine suite and name for unique ID
+                'return_type': 'void' # Tests return void
             })
 
         return functions
 
     def print_validation_report(self, report: Dict):
         """Print a formatted validation report"""
-        print(f"\n📋 {report['file']}")
+        print(f"\n[REPORT] {report['file']}")
         print(f"   Quality: {report['quality']}")
-        print(f"   Compiles: {'✅' if report['compiles'] else '❌'}")
-        print(f"   Realistic: {'✅' if report['realistic'] else '❌'}")
+        print(f"   Compiles: {'YES' if report['compiles'] else 'NO'}")
+        print(f"   Realistic: {'YES' if report['realistic'] else 'NO'}")
 
         if report['issues']:
             print(f"   Issues ({len(report['issues'])}):")

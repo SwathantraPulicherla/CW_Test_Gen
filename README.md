@@ -1,6 +1,6 @@
-# AI C Test Generator
+# AI C/C++ Test Generator
 
-AI-powered unit test generator for C code using Google Gemini AI. Automatically generates comprehensive Unity framework tests for your C functions with intelligent stub generation and validation.
+AI-powered unit test generator for C and C++ code using Google Gemini AI. Automatically generates comprehensive Google Test framework tests for your functions with intelligent stub generation and validation.
 
 ## Features
 
@@ -73,6 +73,8 @@ ai-c-testgen [OPTIONS]
 - `--quality-threshold LEVEL`: Minimum acceptable quality threshold (**high**/medium/low, default: **high**)
 - `--verbose, -v`: Enable verbose output
 - `--version`: Show version information
+ - `--wait-before-exit`: Wait for user input before exiting to preserve terminal output (useful for GUI or CI tasks)
+ - `--log-file PATH`: Path to a file where CLI output will be logged (relative to repo root by default)
 
 ### Examples
 
@@ -113,3 +115,31 @@ your-project/
 ```
 
 ... (README continues)
+
+## Keep Terminal Output After Run
+
+If you're running the CLI from a GUI or tasks and want to retain the terminal output after the process exits, use either:
+
+- The `--wait-before-exit` option to pause the CLI and keep the terminal visible until you press Enter:
+```bash
+ai-c-testgen --repo-path /path/to/project --wait-before-exit
+```
+
+- Or `--log-file` to write the run output to a file which you can inspect later:
+```bash
+ai-c-testgen --repo-path /path/to/project --log-file tests/run.log
+```
+
+If you're using VS Code tasks to run the CLI, ensure the task's `presentation` block does not clear the terminal, e.g.:
+```json
+"presentation": {
+   "reveal": "always",
+   "panel": "shared",
+   "clear": false
+}
+```
+
+Another option when launching PowerShell from another process is to use the `-NoExit` flag:
+```powershell
+powershell -NoExit -Command "ai-c-testgen --repo-path ."
+```

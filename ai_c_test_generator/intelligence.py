@@ -7,6 +7,7 @@ import re
 from typing import Dict, List, Tuple
 from pathlib import Path
 import json
+import requests
 
 import google.generativeai as genai
 
@@ -14,9 +15,38 @@ import google.generativeai as genai
 class TestIntelligenceAnalyzer:
     """AI-powered test intelligence analyzer for root cause identification and fix guidance"""
 
-    def __init__(self, api_key: str):
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel('gemini-2.5-flash')
+    def __init__(self, api_key: str = None, model_choice: str = "gemini", ollama_url: str = "http://127.0.0.1:11434/api/generate", ollama_model: str = "qwen2.5-coder"):
+        self.model_choice = model_choice
+        self.ollama_url = ollama_url
+        self.ollama_model = ollama_model
+        
+        if self.model_choice == "gemini":
+            if not api_key:
+                raise ValueError("API key required for Gemini model")
+            genai.configure(api_key=api_key)
+            self.model = genai.GenerativeModel('gemini-2.5-flash')
+        elif self.model_choice == "ollama":
+            pass # Connection check happens on first call or could be added here
+        else:
+            raise ValueError(f"Invalid model choice: {model_choice}")
+
+    def _call_llm(self, prompt: str) -> str:
+        """Call the selected LLM with the prompt"""
+        if self.model_choice == "gemini":
+            response = self.model.generate_content(prompt)
+            return response.text
+        elif self.model_choice == "ollama":
+            payload = {
+                "model": self.ollama_model,
+                "prompt": prompt,
+                "stream": False
+            }
+            # Use a generous timeout for analysis as it can be complex
+            response = requests.post(self.ollama_url, json=payload, timeout=300)
+            response.raise_for_status()
+            return response.json()["response"]
+        else:
+            raise ValueError(f"Unknown model choice: {self.model_choice}")
 
     def analyze_test_failures(self, test_results: Dict, source_files: List[str]) -> Dict:
         """
@@ -91,10 +121,11 @@ class TestIntelligenceAnalyzer:
         """
 
         try:
-            response = self.model.generate_content(analysis_prompt)
-            analysis = json.loads(response.text.strip('```json\n').strip('```'))
+            response_text = self._call_llm(analysis_prompt)
+            analysis = json.loads(response_text.strip('```json\n').strip('```'))
         except Exception as e:
             # Fallback analysis if AI fails
+            print(f"[WARN] AI Analysis failed: {e}")
             analysis = self._fallback_analysis(test_name, result)
 
         analysis['test_name'] = test_name

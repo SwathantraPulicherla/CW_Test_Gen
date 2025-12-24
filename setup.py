@@ -12,7 +12,7 @@ setup(
     version="1.0.0",
     author="AI C Test Generator Team",
     author_email="testgen@example.com",
-    description="AI-powered C test generator",
+    description="AI-powered C and C++ test generator",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/your-org/ai-c-test-generator",
