@@ -6,7 +6,7 @@ import os
 import re
 from typing import Dict, List
 
-from .analyzer import DependencyAnalyzer
+from ai_c_test_analyzer.analyzer import DependencyAnalyzer
 
 
 class TestValidator:
@@ -135,6 +135,12 @@ class TestValidator:
         if len(function_names) != len(set(function_names)):
             duplicates = [name for name in function_names if function_names.count(name) > 1]
             result['issues'].append(f"Duplicate function definitions: {duplicates}")
+            result['compiles'] = False
+
+        # Check for invalid lambda assignment to member functions (Monkey-patching attempt)
+        # Pattern: ->.* = \[
+        if re.search(r'->\w+\s*=\s*\[', test_content):
+            result['issues'].append("CRITICAL SYNTAX ERROR: Attempted to assign lambda to member function (monkey-patching). C++ DOES NOT SUPPORT THIS. Use global stubs instead.")
             result['compiles'] = False
 
         # Check for invalid function calls (like main()) - but allow if main() is simple and testable

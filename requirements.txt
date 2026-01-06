@@ -1,6 +1,9 @@
 # AI C Test Generator Requirements
 # Core dependencies
+requests>=2.25.0
+openai>=1.0.0
 google-generativeai>=0.8.4
+ai-c-test-analyzer>=0.1.0
 
 # Optional dev packages
 pytest

@@ -6,6 +6,7 @@ CLI interface for AI C Test Generator
 import argparse
 import os
 import sys
+import json
 from pathlib import Path
 
 # Add compatibility for older Python versions
@@ -22,7 +23,7 @@ except ImportError:
 
 from .generator import SmartTestGenerator
 from .validator import TestValidator
-from .analyzer import DependencyAnalyzer
+from ai_c_test_analyzer.analyzer import DependencyAnalyzer
 
 
 def create_parser():
@@ -101,9 +102,9 @@ Examples:
     parser.add_argument(
         '--model',
         type=str,
-        choices=['ollama', 'gemini', 'groq'],
+        choices=['ollama', 'gemini', 'groq', 'github'],
         default='gemini',
-        help='AI model to use: ollama (local, safe), gemini (cloud, requires API key), or groq (fast cloud, requires API key)'
+        help='AI model to use: ollama (local, safe), gemini (cloud, requires API key), groq (fast cloud, requires API key), or github (GitHub Models, requires GITHUB_TOKEN)'
     )
     parser.add_argument(
         '--log-file',
@@ -164,6 +165,20 @@ Examples:
         help='Skip generation if a valid (compilable and realistic) test file already exists'
     )
 
+    parser.add_argument(
+        '--mode',
+        type=str,
+        choices=['generate', 'analyze'],
+        default='generate',
+        help='Operation mode: generate tests (default) or analyze repository only'
+    )
+
+    parser.add_argument(
+        '--analysis-file',
+        type=str,
+        help='Path to pre-computed analysis JSON file (for generate mode)'
+    )
+
     return parser
 
 
@@ -171,8 +186,8 @@ def list_functions_for_file(file_path, repo_path, verbose=False):
     """List functions in a file for debugging/mapping"""
     try:
         analyzer = DependencyAnalyzer(repo_path)
-        analysis = analyzer.analyze_file_dependencies(file_path)
-        functions = analysis.get('functions', [])
+        # Extract functions directly from the file
+        functions = analyzer._extract_functions(file_path)
         if verbose and functions:
             print(f"   [INFO] [MAPPED] Found {len(functions)} functions in {os.path.basename(file_path)}:")
             for func in functions[:10]:  # Limit to first 10 for brevity
@@ -211,14 +226,17 @@ def validate_environment(args):
 
     print(f"[INFO] [DEBUG] Found {len(c_files)} files")
     # Check API key only if cloud model is selected
-    if args.model in ['gemini', 'groq']:
-        api_key = args.api_key or os.getenv('GEMINI_API_KEY') or os.getenv('GROQ_API_KEY')
+    if args.model in ['gemini', 'groq', 'github']:
+        api_key = args.api_key or os.getenv('GEMINI_API_KEY') or os.getenv('GROQ_API_KEY') or os.getenv('GITHUB_TOKEN')
         if not api_key:
-            print(f"[ERROR] {args.model.title()} model requires API key. Set {args.model.upper()}_API_KEY environment variable or use --api-key")
+            env_var = f"{args.model.upper()}_API_KEY" if args.model != 'github' else "GITHUB_TOKEN"
+            print(f"[ERROR] {args.model.title()} model requires API key. Set {env_var} environment variable or use --api-key")
             if args.model == 'gemini':
                 print("   Get your API key from: https://makersuite.google.com/app/apikey")
             elif args.model == 'groq':
                 print("   Get your API key from: https://console.groq.com/keys")
+            elif args.model == 'github':
+                print("   Get your GitHub token from: https://github.com/settings/tokens")
             return False
         print(f"[INFO] [DEBUG] API key found for {args.model.title()}")
     else:
@@ -238,6 +256,61 @@ def main():
         print("[ERROR] [DEBUG] Environment validation failed")
         sys.exit(1)
 
+    # Handle Analysis Mode
+    if args.mode == 'analyze':
+        print("[START] AI C Test Generator - Analysis Mode")
+        print(f"   Repository: {args.repo_path}")
+        
+        try:
+            # Find repo root (parent of repo_path if repo_path is a subdirectory)
+            repo_root = args.repo_path
+            if os.path.exists(os.path.join(args.repo_path, '.git')):
+                repo_root = args.repo_path
+            else:
+                # Try to find git root by going up directories
+                current = args.repo_path
+                for _ in range(3):  # Go up max 3 levels
+                    parent = os.path.dirname(current)
+                    if os.path.exists(os.path.join(parent, '.git')):
+                        repo_root = parent
+                        break
+                    current = parent
+
+            analyzer = DependencyAnalyzer(args.repo_path, base_path=repo_root)
+            scan_results = analyzer.perform_repo_scan()
+            
+            # Save to JSON
+            output_path = args.output
+            # If output is relative, make it relative to repo_root
+            if not os.path.isabs(output_path):
+                output_path = os.path.join(repo_root, output_path)
+                
+            if not output_path.endswith('.json'):
+                 output_path = os.path.join(output_path, 'analysis', 'analysis.json')
+            
+            output_dir = os.path.dirname(output_path)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            
+            # Convert sets to lists for JSON serialization
+            def set_default(obj):
+                if isinstance(obj, set):
+                    return list(obj)
+                raise TypeError
+                
+            with open(output_path, 'w') as f:
+                json.dump(scan_results, f, default=set_default, indent=2)
+                
+            print(f"[SUCCESS] Analysis saved to {output_path}")
+            sys.exit(0)
+        except Exception as e:
+            print(f"[ERROR] Analysis failed: {e}")
+            if args.verbose:
+                import traceback
+                traceback.print_exc()
+            sys.exit(1)
+
+    # Generate Mode - API Key Validation
     api_key = None
     if args.model == 'gemini':
         api_key = args.api_key or os.getenv('GEMINI_API_KEY')
@@ -251,11 +324,17 @@ def main():
             print("[ERROR] Groq model requires API key. Set GROQ_API_KEY environment variable or use --api-key")
             print("   Get your API key from: https://console.groq.com/keys")
             sys.exit(1)
+    elif args.model == 'github':
+        api_key = args.api_key or os.getenv('GITHUB_TOKEN')
+        if not api_key:
+            print("[ERROR] GitHub model requires token. Set GITHUB_TOKEN environment variable or use --api-key")
+            print("   Get your GitHub token from: https://github.com/settings/tokens")
+            sys.exit(1)
     elif args.model == 'ollama':
         # Ollama doesn't need API key
         pass
     else:
-        print(f"[ERROR] Invalid model: {args.model}. Choose 'ollama', 'gemini', or 'groq'")
+        print(f"[ERROR] Invalid model: {args.model}. Choose 'ollama', 'gemini', 'groq', or 'github'")
         sys.exit(1)
 
     print(f"[INFO] [DEBUG] API key found: {'Yes' if api_key else 'No (using Ollama)'}")
@@ -289,16 +368,33 @@ def main():
         )
         validator = TestValidator(args.repo_path)
 
-        # Build dependency map
-        dependency_map = {}
-        if not args.file:
+        # Build repo scan
+        repo_scan = {}
+        if args.analysis_file:
+            print(f"[INFO] Loading analysis from {args.analysis_file}...", flush=True)
+            try:
+                with open(args.analysis_file, 'r') as f:
+                    repo_scan = json.load(f)
+                print(f"[INFO] Loaded analysis for {len(repo_scan.get('function_index', {}))} functions", flush=True)
+                
+                # Convert lists back to sets for hardware_flags if needed (though generator handles lists now)
+                # But let's be safe and ensure consistency if generator expects sets in some places
+                if 'hardware_flags' in repo_scan:
+                    for func, flags in repo_scan['hardware_flags'].items():
+                        if isinstance(flags, list):
+                            repo_scan['hardware_flags'][func] = set(flags)
+                            
+            except Exception as e:
+                print(f"[ERROR] Failed to load analysis file: {e}")
+                sys.exit(1)
+        elif not args.file:
             if args.verbose:
-                print("[INFO] [DEBUG] Building dependency map...", flush=True)
-            dependency_map = generator.build_dependency_map(args.repo_path)
+                print("[INFO] [DEBUG] Performing repo scan...", flush=True)
+            repo_scan = generator.build_dependency_map(args.repo_path)
             if args.verbose:
-                print(f"[INFO] [DEBUG] Dependency map built ({len(dependency_map)} items)", flush=True)
+                print(f"[INFO] [DEBUG] Repo scan complete ({len(repo_scan.get('function_index', {}))} functions indexed)", flush=True)
         else:
-            print("[INFO] [DEBUG] Skipping global dependency map for single file mode", flush=True)
+            print("[INFO] [DEBUG] Skipping global repo scan for single file mode", flush=True)
 
         # Find C files in entire repository (excluding tests/, build/, and CMakeFiles/ directories)
         c_files = []
@@ -314,6 +410,11 @@ def main():
                     if file == 'main.cpp':
                         if args.verbose:
                             print(f"[SKIP] Skipping {file} (application entry point)")
+                        continue
+                    # Skip files starting with test_ as they are generated test files
+                    if file.startswith('test_'):
+                        if args.verbose:
+                            print(f"[SKIP] Skipping {file} (generated test file)")
                         continue
                     c_files.append(os.path.join(root, file))
 
@@ -371,13 +472,28 @@ def main():
         validation_reports = []
         regeneration_stats = {'total_regenerations': 0, 'successful_regenerations': 0}
 
+        # Determine output directory (central tests/ directory at repo root)
+        # Find repo root (parent of repo_path if repo_path is a subdirectory)
+        repo_root = args.repo_path
+        if os.path.exists(os.path.join(args.repo_path, '.git')):
+            repo_root = args.repo_path
+        else:
+            # Try to find git root by going up directories
+            current = args.repo_path
+            for _ in range(3):  # Go up max 3 levels
+                parent = os.path.dirname(current)
+                if os.path.exists(os.path.join(parent, '.git')):
+                    repo_root = parent
+                    break
+                current = parent
+        
+        output_dir = os.path.join(repo_root, args.output)
+        os.makedirs(output_dir, exist_ok=True)
+        output_dirs.add(output_dir)
+
         for file_path in c_files:
             rel_path = os.path.relpath(file_path, args.repo_path)
             print(f"[PROC] Processing: {rel_path}")
-
-            # Determine output directory for this file (central tests/ directory)
-            output_dir = os.path.join(args.repo_path, 'tests')
-            os.makedirs(output_dir, exist_ok=True)
             output_dirs.add(output_dir)
 
             # Check if valid test already exists
@@ -424,7 +540,7 @@ def main():
                 try:
                     # Generate tests for this file
                     result = generator.generate_tests_for_file(
-                        file_path, args.repo_path, output_dir, dependency_map, final_validation if attempt > 1 else None
+                        file_path, args.repo_path, output_dir, repo_scan, final_validation if attempt > 1 else None
                     )
 
                     if not result['success']:

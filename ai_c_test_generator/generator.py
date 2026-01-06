@@ -5,13 +5,14 @@ AI Test Generator - Core test generation logic
 import os
 import re
 import time
+import json
 from pathlib import Path
 from typing import Dict, List
 
 import requests
 import google.generativeai as genai
 
-from .analyzer import DependencyAnalyzer
+from ai_c_test_analyzer.analyzer import DependencyAnalyzer
 
 
 class SmartTestGenerator:
@@ -36,7 +37,10 @@ class SmartTestGenerator:
         self.ollama_url = "http://127.0.0.1:11434/api/generate"
         self.ollama_model = "qwen2.5-coder"
         self.groq_url = "https://api.groq.com/openai/v1/chat/completions"
-        self.groq_model = "llama-3.3-70b-versatile"
+        # self.groq_model = "llama-3.3-70b-versatile"  # Previous model
+        self.groq_model = "openai/gpt-oss-120b"
+        self.github_url = "https://models.github.ai/inference/chat/completions"
+        self.github_model = "gpt-4o"
 
         self._initialize_model()
 
@@ -178,8 +182,30 @@ class SmartTestGenerator:
             except Exception as e:
                 raise RuntimeError(f"Failed to initialize Groq model: {e}")
         
+        elif self.model_choice == "github":
+            if not self.api_key:
+                raise RuntimeError("GitHub token not provided. Use --api-key or GITHUB_TOKEN env var.")
+            try:
+                # Test GitHub connection
+                print(f"[INFO] [INIT] Testing GitHub connection with model: {self.github_model}", flush=True)
+                headers = {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                }
+                payload = {
+                    "model": self.github_model,
+                    "messages": [{"role": "user", "content": "test"}],
+                    "max_tokens": 10
+                }
+                response = requests.post(self.github_url, json=payload, headers=headers, timeout=30)
+                response.raise_for_status()
+                self.current_model_name = f"github:{self.github_model}"
+                print(f"[PASS] [DEBUG] GitHub model '{self.github_model}' initialized", flush=True)
+            except Exception as e:
+                raise RuntimeError(f"Failed to initialize GitHub model: {e}")
+        
         else:
-            raise ValueError("Invalid model choice. Must be 'ollama', 'gemini', or 'groq'.")
+            raise ValueError("Invalid model choice. Must be 'ollama', 'gemini', 'groq', or 'github'.")
 
 
         if self.model_choice == 'gemini' and self.model is None:
@@ -279,7 +305,6 @@ Syntax: Perfect C - complete statements, matching braces, semicolons, no unused 
                 except Exception as e:
                     print(f"[WARN] Ollama generation failed (attempt {attempt + 1}): {e}")
                     if attempt < max_retries - 1:
-                        import time
                         time.sleep(2)
                     else:
                         raise e
@@ -295,7 +320,6 @@ Syntax: Perfect C - complete statements, matching braces, semicolons, no unused 
                 except Exception as e:
                     print(f"[WARN] Gemini generation failed (attempt {attempt + 1}): {e}")
                     if attempt < max_retries - 1:
-                        import time
                         # Exponential backoff for rate limits
                         sleep_time = min(2 ** attempt, 60)  # Max 60 seconds
                         print(f"[INFO] Waiting {sleep_time}s before retry...")
@@ -331,7 +355,41 @@ Syntax: Perfect C - complete statements, matching braces, semicolons, no unused 
                 except Exception as e:
                     print(f"[WARN] Groq generation failed (attempt {attempt + 1}): {e}")
                     if attempt < max_retries - 1:
-                        import time
+                        # Exponential backoff for rate limits
+                        sleep_time = min(2 ** attempt, 60)  # Max 60 seconds
+                        print(f"[INFO] Waiting {sleep_time}s before retry...")
+                        time.sleep(sleep_time)
+                    else:
+                        raise e
+        
+        elif self.model_choice == "github":
+            for attempt in range(max_retries):
+                try:
+                    print(f"[INFO] [LLM] Sending request to GitHub ({self.github_model})...", flush=True)
+                    start_time = time.time()
+                    headers = {
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json"
+                    }
+                    payload = {
+                        "model": self.github_model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 4096,
+                        "temperature": 0.1
+                    }
+                    response = requests.post(self.github_url, json=payload, headers=headers, timeout=300)
+                    response.raise_for_status()
+                    result = response.json()
+                    duration = time.time() - start_time
+                    print(f"[INFO] [LLM] Response received in {duration:.2f}s", flush=True)
+                    # Create a mock response object with text attribute
+                    class MockResponse:
+                        def __init__(self, text):
+                            self.text = text
+                    return MockResponse(result["choices"][0]["message"]["content"])
+                except Exception as e:
+                    print(f"[WARN] GitHub generation failed (attempt {attempt + 1}): {e}")
+                    if attempt < max_retries - 1:
                         # Exponential backoff for rate limits
                         sleep_time = min(2 ** attempt, 60)  # Max 60 seconds
                         print(f"[INFO] Waiting {sleep_time}s before retry...")
@@ -346,30 +404,84 @@ Syntax: Perfect C - complete statements, matching braces, semicolons, no unused 
     def call_llm(self, prompt: str):
         return self._try_generate_with_fallback(prompt)
 
-    def build_dependency_map(self, repo_path: str) -> Dict[str, str]:
-        """Build a map of function_name -> source_file for the entire repository"""
-        print("[INFO] [DEPS] Building global dependency map...")
+    def build_dependency_map(self, repo_path: str) -> Dict:
+        """Build comprehensive repo scan for dependency analysis"""
         analyzer = DependencyAnalyzer(repo_path)
-        all_cpp_files = analyzer.find_all_c_files()
+        return analyzer.perform_repo_scan()
 
-        dependency_map = {}
-        for file_path in all_cpp_files:
-            functions = analyzer._extract_functions(file_path)
-            for func in functions:
-                dependency_map[func['name']] = file_path
-
-        print(f"   Mapped {len(dependency_map)} functions across {len(all_cpp_files)} files")
-        return dependency_map
-
-    def generate_tests_for_file(self, file_path: str, repo_path: str, output_dir: str, dependency_map: Dict[str, str], validation_feedback: Dict = None) -> Dict:
-        """Generate tests for a SINGLE file with proper context"""
+    def generate_tests_for_file(self, file_path: str, repo_path: str, output_dir: str, repo_scan: Dict, validation_feedback: Dict = None) -> Dict:
+        """Generate tests for a SINGLE file with proper context from repo scan"""
         print(f"[INFO] Generating tests for {os.path.basename(file_path)}...", flush=True)
+        
         analyzer = DependencyAnalyzer(repo_path)
+        
+        # Get structured analysis (Stage 0)
+        file_analysis_json = analyzer.get_file_analysis(file_path, repo_scan)
+        
+        # Filter for testable functions
+        testable_functions = [f for f in file_analysis_json['functions'] if f['testable']]
+        
+        if not testable_functions:
+             print(f"[SKIP] {os.path.basename(file_path)} has no testable functions.")
+             return {'success': False, 'reason': 'no_testable_functions'}
 
-        # Analyze this specific file
-        analysis = analyzer.analyze_file_dependencies(file_path)
+        # Legacy analysis for prompt construction (includes, stubs, etc.)
+        # Handle both repo-scan mode and single-file mode
+        if repo_scan and 'function_index' in repo_scan:
+            # Multi-file mode: use repo scan data
+            rel_file_path = os.path.relpath(file_path, repo_path)
+            functions_in_file = []
+            called_functions = set()
+            
+            # Get functions defined in this file
+            for func_name, func_info in repo_scan['function_index'].items():
+                if func_info.get('file') == rel_file_path:
+                    functions_in_file.append({
+                        'name': func_name,
+                        'signature': func_info.get('signature', ''),
+                        'body': func_info.get('body', '')
+                    })
+            
+            # Get functions called by this file (from call graph)
+            for caller, callees in repo_scan['call_graph'].items():
+                caller_info = repo_scan['function_index'].get(caller, {})
+                if caller_info.get('file') == rel_file_path:
+                    called_functions.update(callees)
+            
+            # Get includes for this file
+            file_index = repo_scan['file_index']
+            includes = file_index.get(rel_file_path, {}).get('includes', [])
+        else:
+            # Single-file mode: fall back to direct file analysis
+            print("[INFO] Single-file mode: performing direct file analysis...", flush=True)
+            functions_in_file = analyzer._extract_functions(file_path)
+            called_functions = set()
+            includes = analyzer._extract_includes(file_path)
+            
+            # Convert to expected format
+            functions_in_file = [{'name': f['name'], 'signature': f.get('signature', ''), 'body': f.get('body', '')} for f in functions_in_file]
+        
+        analysis = {
+            'functions': functions_in_file,
+            'called_functions': list(called_functions),
+            'includes': includes,
+            'file_path': file_path,
+            'structured_analysis': file_analysis_json # Pass the structured analysis
+        }
+        
         print(f"[INFO] Analysis complete: {len(analysis['functions'])} functions found", flush=True)
 
+        # Use repo scan data for decisions (if available)
+        if repo_scan and 'hardware_flags' in repo_scan:
+            hardware_flags = repo_scan['hardware_flags']
+            call_depths = repo_scan['call_depths']
+            function_index = repo_scan['function_index']
+        else:
+            # Single-file mode: provide defaults
+            hardware_flags = {}
+            call_depths = {}
+            function_index = {}
+        
         # IDENTIFY FUNCTIONS THAT NEED STUBS AND FUNCTIONS TO INCLUDE DIRECTLY
         functions_that_need_stubs = []
         functions_to_include_directly = []
@@ -377,12 +489,29 @@ Syntax: Perfect C - complete statements, matching braces, semicolons, no unused 
 
         for called_func in analysis['called_functions']:
             if called_func not in implemented_functions:
-                if called_func in dependency_map and dependency_map[called_func] != file_path:
-                    # Function is defined in another file in the same repo - include directly
+                # Check if it's a hardware dependency (using the set from analyzer)
+                # Note: hardware_flags is now Dict[str, Set[str]] or Dict[str, bool] depending on if we updated repo_scan
+                # But get_file_analysis handles the set. Here we might still have old format if repo_scan wasn't updated.
+                # Assuming repo_scan is updated or we handle it.
+                
+                is_hw = False
+                if isinstance(hardware_flags.get(called_func), set):
+                    is_hw = len(hardware_flags.get(called_func)) > 0
+                else:
+                    is_hw = hardware_flags.get(called_func, False)
+
+                if called_func in function_index and not is_hw and call_depths.get(called_func, 0) <= 2:
+                    # Function is defined in repo, hardware-free, and within depth 2 - include directly
                     functions_to_include_directly.append(called_func)
                 else:
-                    # True external or unknown - may need stubbing if deterministically testable
+                    # External, hardware-touching, or too deep - stub or skip
                     functions_that_need_stubs.append(called_func)
+
+        # DEBUG: Print what we're sending to the AI
+        print(f"[DEBUG] Analysis for {os.path.relpath(file_path, repo_path)}:")
+        print(f"[DEBUG] Functions found: {[f['name'] for f in analysis['functions']]}")
+        print(f"[DEBUG] Functions to include directly: {functions_to_include_directly}")
+        print(f"[DEBUG] Functions that need stubs: {functions_that_need_stubs}")
 
         print(f"   [INFO] {os.path.basename(file_path)}: {len(analysis['functions'])} functions, {len(functions_to_include_directly)} repo includes, {len(functions_that_need_stubs)} need stubs", flush=True)
 
@@ -397,6 +526,11 @@ Syntax: Perfect C - complete statements, matching braces, semicolons, no unused 
 
         # POST-PROCESSING: Clean up common AI generation issues
         test_code = self._post_process_test_code(test_code, analysis, analysis['includes'])
+
+        # Add list of skipped functions due to hardware dependency
+        if functions_that_need_stubs:
+            skipped_comment = f"\n// Skipped due to hardware dependency: {', '.join(functions_that_need_stubs)}"
+            test_code += skipped_comment
 
         # Remove gtest includes for C files (Unity tests)
         if self._detect_language(file_path) == 'c':
@@ -468,7 +602,19 @@ ARDUINO/ESP32 TESTING STANDARDS (MANDATORY):
    - In `SetUp()`: call `reset_arduino_stubs()` FIRST, then instantiate the class under test.
    - In `TearDown()`: delete the instance, then call `reset_arduino_stubs()`.
 4. CRITICAL: Test the REAL class implementation. NEVER mock the class under test (e.g., no MockCLed : public c_led).
-5. CRITICAL: Set member variables explicitly in tests (blynkServer, blynkParam, etc.) when they affect behavior.
+   - C++ IS NOT DYNAMIC: You CANNOT assign lambdas to member functions (e.g., `blynk->func = []...` is ILLEGAL/IMPOSSIBLE).
+   - Test the full call chain. If `updateBlynkState` calls `isDeviceConnected`, let it call the REAL `isDeviceConnected`.
+   - To control internal logic (like `isDeviceConnected` returning false), configure the GLOBAL STUBS it uses.
+   - **HTTPClient MOCKING**: The `HTTPClient` stub uses STATIC members to control behavior across all instances.
+     - To mock a successful GET request:
+       `HTTPClient::mock_response_code = 200;`
+       `HTTPClient::mock_response_body = "some_response";`
+     - To mock a failure:
+       `HTTPClient::mock_response_code = 404;`
+     - Do NOT try to mock `HTTPClient` by subclassing or passing it in. It is a local variable in the source code.
+5. CRITICAL: Respect access modifiers. Do NOT access private/protected members directly.
+   - If a member is private, use public setters or constructor to influence it.
+   - If no public access exists, rely on default values or internal logic.
 6. Verify Serial output using `Serial.outputBuffer` (accumulated string).
    - Access: `Serial.outputBuffer` (it is a String object).
    - Verify: `EXPECT_STREQ(Serial.outputBuffer.c_str(), "expected output\\n");`
@@ -480,210 +626,187 @@ ARDUINO/ESP32 TESTING STANDARDS (MANDATORY):
    - Example: `EXPECT_EQ(delay_calls[0].ms, 1000);`
    - CRITICAL: Do NOT compare `delay_calls[i]` directly to an int. Access `.ms`.
    - CRITICAL: Do NOT compare `digitalWrite_calls[i]` directly. Access `.pin` and `.value`.
+9. CRITICAL: Do NOT define local mock classes (e.g., `class MockSPIFFS`) if `Arduino_stubs.h` already provides them.
+   - Use the global instances provided by stubs: `SPIFFS`, `Serial`.
+   - For `HTTPClient`, use the static members as described above.
 """
 
+        structured_analysis_json = ""
+        if 'structured_analysis' in analysis:
+            structured_analysis_json = json.dumps(analysis['structured_analysis'], indent=2)
+
         prompt = f"""
-You are writing C++17 code for a host-based GoogleTest environment.
+You are an expert C++ unit test generation agent for embedded systems.
 
-STRICT RULES (do not violate):
-1. Do NOT invent or mock hardware, HTTP, SPIFFS, or Arduino APIs.
-2. Assume the following files already exist and are correct:
-   - Arduino_stubs.h (provides Serial, digitalWrite, delay, String)
-   - MockHTTPClient.h (already implemented)
-   - MockSPIFFS.h (already implemented)
-3. You MUST reuse existing mocks only. Do NOT redefine them.
-4. Do NOT create local objects that are not used by the class under test.
-5. Do NOT assume dependency injection unless explicitly provided.
-6. Do NOT assume global side effects unless visible in code.
-7. If something cannot be tested deterministically, SKIP that test.
-8. All tests MUST compile on a normal PC with g++.
-9. The output MUST be a single .cpp test file.
-10. NO explanations. Output ONLY compilable code.
+You generate HOST-BASED, DETERMINISTIC GoogleTest unit tests for embedded C/C++ code.
+Your output must compile on a desktop compiler using GoogleTest and provided stubs.
+You are NOT simulating hardware. You are NOT guessing behavior.
 
-ENVIRONMENT DETAILS:
-- Language: C++17
-- Test framework: GoogleTest
-- Platform: Linux / Windows host (NOT Arduino)
-- No real networking, filesystem, or hardware allowed.
+========================
+CORE SCOPE (NON-NEGOTIABLE)
+========================
 
-GOAL:
-Generate GoogleTest unit tests ONLY for the following file:
-<PASTE c_led.cpp or other file here>
+The tool’s scope is:
 
-TESTING STRATEGY:
-- Test only observable behavior.
-- Verify side effects via existing stubs (Serial.outputBuffer, call logs).
-- Prefer fewer correct tests over many fake ones.
-- If behavior depends on unmocked internals, do NOT test it.
+• Generate unit tests for PURE SOFTWARE LOGIC and SUPPORTED STUBS
+• Explicitly SKIP *unsupported* hardware-dependent code (e.g. WiFi, RTOS)
+• NEVER invent or guess hardware behavior
+• NEVER monkey-patch C++ methods
 
-FINAL CHECK BEFORE OUTPUT:
-- Does this code compile without additional mocks?
-- Does each test actually influence the code under test?
-- Would a senior C++ reviewer accept this?
+If a function cannot be tested deterministically on host (even with stubs), it MUST be skipped.
 
-You are a Senior Embedded Validation Engineer with 15+ years of experience in automotive and IoT firmware testing.
+========================
+ABSOLUTE C++ RULES
+========================
 
-Generate a PRODUCTION-GRADE GoogleTest unit test file for the following C++ source code.
+C++ IS STATIC. These are FORBIDDEN:
 
-STRICT REQUIREMENTS:
-1. The test file MUST be:
-   - Fully runnable
-   - Deterministic in CI
-   - Side-effect safe
-   - Zero undefined behavior
-   - If something cannot be tested deterministically, SKIP that test.
-   - Do NOT invent or mock hardware, HTTP, SPIFFS, or Arduino APIs.
-   - Reuse existing mocks only (MockHTTPClient.h, MockSPIFFS.h).
-   - Test only observable behavior via existing stubs (Serial.outputBuffer, call logs).
-   - Prefer fewer correct tests over many fake ones.
+❌ Assigning lambdas to member functions
+   (e.g. obj->func = [](){{}})
+❌ Replacing methods at runtime
+❌ Mocking the class under test
+❌ Python/JS-style monkey patching
+❌ Guessing constructors or private access
 
-REPO-WIDE INTEGRATION:
-- For functions defined in the same repository, include their headers and call them directly. Only stub true externals (e.g., HTTP, SPIFFS) using existing mocks.
-- Add a repo-wide build option: When running tests, compile all repo files together (e.g., via CMake) so cross-file calls work without stubs.
-- Direct calls to repo functions are deterministic if those functions are pure or have controlled inputs. Only skip if a function truly can't be tested (e.g., depends on unmappable hardware).
+If you violate any of these, the output is INVALID.
 
-2. CRITICAL TESTING ARCHITECTURE (MANDATORY):
-   - NEVER mock the class under test (e.g., do NOT create MockCLed : public c_led)
-   - Test the REAL class implementation, not mocks
-   - Mock ONLY external dependencies using existing mocks (MockHTTPClient.h, MockSPIFFS.h)
-   - Use Arduino_stubs.h for Arduino I/O functions (digitalWrite, delay, Serial)
-   - For classes with dependencies, use dependency injection or factory patterns if needed
-   - Verify REAL firmware behavior, not mock expectations
-   - If behavior depends on unmocked internals, SKIP that test
+========================
+HARDWARE BOUNDARY RULES
+========================
 
-3. CRITICAL SOURCE CODE ANALYSIS (MANDATORY):
-   - ANALYZE the actual source code behavior BEFORE writing tests
-   - Extract ALL string literals, variable names, and logic paths from source
-   - NEVER hard-code expected outputs that don't exist in the source code
-   - For classes with member variables (blynkServer, blynkParam, etc.), set them explicitly in tests
-   - Detect and test for bugs (infinite recursion, stack overflow, etc.)
-   - Test error conditions and edge cases that actually exist in the code
-   - Use correct class naming (CBlynkTest for c_blynk, not CLedTest)
-   - Remove unnecessary extern declarations (no extern main, etc.)
+A function is UNSUPPORTED HARDWARE-DEPENDENT if it calls:
 
-3. You MUST:
-   - Verify ALL digitalWrite calls by accessing `.pin` and `.value` members (NEVER compare struct directly)
-   - Verify ALL delay() calls by accessing `.ms` member (NEVER compare struct directly)
-   - Verify Serial output without assuming buffer overwrite (handle APPEND behavior safely)
-   - Verify BOTH state transitions in any function that toggles hardware
-   - Verify ALL iterations in loops (not just first iteration)
-   - Verify constructor side effects INSIDE the test, not via SetUp() artifacts
+• WiFi.* (except HTTPClient), I2C, SPI, CAN
+• RTOS APIs (FreeRTOS tasks, queues, semaphores)
+• Sensors, timers, randomness (rand()) unless deterministically controlled
 
-4. You MUST:
-   - Verify ALL digitalWrite calls by accessing `.pin` and `.value` members (NEVER compare struct directly)
-   - Verify ALL delay() calls by accessing `.ms` member (NEVER compare struct directly)
-   - Verify Serial output without assuming buffer overwrite (handle APPEND behavior safely)
-   - Verify BOTH state transitions in any function that toggles hardware
-   - Verify ALL iterations in loops (not just first iteration)
-   - Verify constructor side effects INSIDE the test, not via SetUp() artifacts
+For such functions:
+❌ Do NOT generate tests
+❌ Do NOT compile them into the test binary
+✅ Add them to a “Skipped due to hardware dependency” list
+
+Supported Hardware (TEST THESE using stubs):
+• Serial.*, digitalWrite, digitalRead, delay, millis
+• SPIFFS.*, HTTPClient
+
+If Arduino/ESP32 context is detected:
+• Include "Arduino_stubs.h"
+• Use ONLY the global stubs it provides
+• NEVER create local mock classes for Serial, SPIFFS, HTTPClient
+
+========================
+HTTPClient MOCKING (CRITICAL)
+========================
+
+The source code creates local HTTPClient objects.
+You CANNOT intercept them directly.
+
+The ONLY valid way to control behavior is via STATIC stub state:
+
+✅ CORRECT:
+HTTPClient::mock_response_code = 200;
+HTTPClient::mock_response_body = "1";
+
+❌ INVALID:
+blynk->isDeviceConnected = [](){{ return true; }}
+
+========================
+DEPENDENCY HANDLING
+========================
+
+Repo-wide dependency analysis is already done.
+
+Use these rules:
+
+• Repo-internal functions → INCLUDE and CALL directly
+• External non-hardware helpers → stub minimally if deterministic
+• Hardware APIs → SKIP function entirely
+
+Prefer REAL compilation over stubbing whenever possible.
+
+========================
+WHAT TO GENERATE
+========================
+
+For each testable function:
+
+• 3–5 GoogleTest cases
+• Cover ALL branches (normal, edge, error)
+• Use ONLY values derived from source logic
+• Assert REAL outputs, not “was called”
+
+Floating point:
+• Use EXPECT_NEAR with correct tolerance
+• NEVER use direct equality
+
+Structures:
+• Compare fields individually
+
+========================
+WHAT NOT TO GENERATE
+========================
+
+❌ Hardware mocks
+❌ Fake simulations
+❌ Trivial tests that assert nothing
+❌ Arbitrary values not derived from source
+❌ Tests for skipped functions
+
+========================
+OUTPUT FORMAT (STRICT)
+========================
+
+Output ONLY valid C++ code.
+
+Structure must be:
+
+1. /* test_{source_name}.cpp – Auto-generated Expert Google Test Tests */
+2. Includes (<gtest/gtest.h>, <stdint.h>, etc.)
+3. Test fixture (SetUp/TearDown public)
+4. Tests
+5. main() with RUN_ALL_TESTS()
+6. Final comment listing skipped functions
+
+NO markdown
+NO explanations
+NO placeholders
+
+========================
+QUALITY SELF-CHECK (MANDATORY)
+========================
+
+Before output, ensure ALL are YES:
+
+• Compiles on host? YES
+• No monkey-patching? YES
+• No invented behavior? YES
+• Uses real repo code where allowed? YES
+• Deterministic on repeat runs? YES
+• Senior C++ reviewer would approve? YES
+
+If ANY answer is NO — FIX IT BEFORE OUTPUT.
+
+VALIDATION FEEDBACK (CRITICAL - ADDRESS THESE SPECIFIC ISSUES):
+{validation_feedback_section}
+
+ANALYZER OUTPUT (FACTS - DO NOT HALLUCINATE):
+{structured_analysis_json}
 
 HERE IS THE SOURCE CODE TO TEST:
-<PASTE YOUR SOURCE HERE>
-
-{arduino_instructions}
-
-INPUT: SOURCE CODE TO TEST (DO NOT MODIFY)
-/* ==== BEGIN src/{os.path.basename(analysis['file_path'])} ==== */
 {file_content}
-/* ==== END src/{os.path.basename(analysis['file_path'])} ==== */
+
 REPO FUNCTIONS TO INCLUDE DIRECTLY (call these directly; assume headers exist):
 {chr(10).join(f"- {func_name}" for func_name in functions_to_include_directly) or "- None"}
 
 EXTERNAL FUNCTIONS TO MOCK (only these; infer signatures from calls if needed; use typical embedded types):
 {chr(10).join(f"- {func_name}" for func_name in functions_that_need_stubs) or "- None"}
 
-IMPROVED RULES TO PREVENT BROKEN/UNREALISTIC OUTPUT
+========================
+FINAL INSTRUCTION
+========================
 
-1. OUTPUT FORMAT (STRICT - ONLY C++ CODE):
-Output PURE C++ code ONLY. Start with /* test_{source_name}.cpp – Auto-generated Expert Google Test Tests */
-NO markdown, NO ```c:disable-run
-File structure EXACTLY: Comment -> Includes -> Extern declarations (for main and mocks) -> Mocks (only for externals) -> SetUp/TearDown -> Tests -> main with RUN_ALL_TESTS().
-
-2. COMPILATION SAFETY (FIX BROKEN TESTS):
-Includes: ONLY <gtest/gtest.h>, and standard <stdint.h>, <stdbool.h>, <string.h> if used in source or for memset. Do NOT include "{source_name}.h" if not present in source or necessary (e.g., for main.cpp, skip if no public API).
-Signatures: COPY EXACTLY from source. NO mismatches in types, params, returns.
-NO calls to undefined functions. For internals (same file), call directly without mocking to avoid duplicates/linker errors.
-Syntax: Perfect C++ - complete statements, matching braces, semicolons, no unused vars, embedded-friendly (no non-standard libs). Ensure all code is fully written (no placeholders).
-
-3. MEANINGFUL TEST DESIGN (FIX TRIVIAL/UNREALISTIC):
-MANDATORY: Generate tests for EVERY FUNCTION in the source file. Do not skip functions. For each function, create 3-5 focused tests covering all branches and edge cases.
-Focus: Test FUNCTION LOGIC exactly (e.g., for validate_range: assert true/false based on precise source conditions like >= -40 && <=125). For main(), test call sequence (e.g., get_temperature_celsius called once, param to check_temperature_status matches return), and main return 0.
-BAN: Tests with wrong expectations (cross-check source thresholds). BAN "was_called" alone - ALWAYS validate outputs/params.
-Each test: 1 purpose, 3-5 per public function, covering ALL branches/logic from source.
-
-4. REALISTIC TEST VALUES (FIX UNREALISTIC - ENFORCE LIMITS):
-Extract ranges/thresholds from source (e.g., -40.0f to 125.0f for validate; -10.0f for cold).
-Temperatures: -40.0f to 125.0f (allow negatives if in source); normal 0.0f-50.0f. E.g., min: -40.0f, max: 125.0f, nominal: 25.0f, cold: -10.1f.
-Voltages: 0.0f to 5.0f (max 5.5f for edges) unless source allows negatives.
-Currents: 0.0f to 10.0f.
-Integers: Within type limits/source ranges (e.g., raw 0-1023 from rand() % 1024).
-Pointers: Valid or NULL only for error tests.
-BAN: Negative temps/volts unless source handles; absolute zero; huge numbers (>1e6 unless domain-specific).
-
-5. FLOATING POINT HANDLING (MANDATORY):
-ALWAYS: ASSERT_FLOAT_EQ(expected, actual) with tolerance - use EXPECT_NEAR(expected, actual, 0.1f) for temp, 0.01f for voltage, etc.
-NEVER direct equality for floats.
-
-6. MOCK IMPLEMENTATION (FIX BROKEN MOCKS):
-CRITICAL: NEVER mock the class under test. Test the REAL implementation.
-ONLY mock external dependencies using existing mocks (MockHTTPClient.h, MockSPIFFS.h).
-For Arduino I/O: Use Arduino_stubs.h instead of mocking - verify calls via digitalWrite_calls, delay_calls, Serial.outputBuffer.
-For classes with dependencies: Use dependency injection or test with real dependencies where safe.
-Example: If testing c_blynk, use MockHTTPClient but test real c_blynk methods.
-SetUp(): Create mock instances for externals only and set expectations.
-TearDown(): Reset mocks.
-For non-deterministic (e.g., rand-based): Mock to make deterministic; test ranges via multiple configs.
-Do NOT mock printf—comment that output assertion requires redirection (not implemented here).
-If something cannot be tested deterministically, SKIP that test.
-
-7. COMPREHENSIVE TEST SCENARIOS (MEANINGFUL & REALISTIC):
-Normal: Mid-range inputs from source, assert correct computation (e.g., temp status "NORMAL" for 25.0f).
-Edge: Exact min/max from source (e.g., -40.0f true, -40.1f false; -10.0f "NORMAL", -10.1f "COLD").
-Error: Invalid inputs (out-of-range, NULL if applicable), simulate via mocks - assert error code/safe output.
-Cover ALL branches: If/else, returns, etc.
-
-8. AVOID BAD PATTERNS (PREVENT COMMON FAILURES):
-NO arbitrary values (derive from source, e.g., raw=500 for mid).
-NO duplicate/redundant tests (unique per branch).
-NO physical impossibilities or ignoring source thresholds.
-NO tests ignoring outputs - always assert results.
-NO hard-coded expected outputs that don't exist in source code.
-NO tests that assume member variables are set when they're not.
-NO contradictory test cases (same inputs, different expected outputs).
-For internals like rand-based: Mock and test deterministic outputs; check ranges (e.g., 0-1023).
-For main with printf: Assert only on mocks and return; comment on printf limitation.
-DETECT BUGS: Test for infinite recursion (isDeviceConnected(retries--)), uninitialized variables, etc.
-
-9. GOOGLE TEST BEST PRACTICES:
-Appropriate asserts: EXPECT_EQ/ASSERT_EQ for ints, EXPECT_FLOAT_EQ for floats, EXPECT_STREQ for chars, EXPECT_TRUE/FALSE for bools, EXPECT_NE(nullptr, ptr) for pointers.
-CRITICAL: DO NOT use EXPECT_EQ for structs/unions directly. Compare members individually.
-Comments: 1-line above EACH assert: // Expected: [source-based reason, e.g., 25.0f is NORMAL per >85 check]
-Handle complex types: Field-by-field for structs, both views for unions, masks for bitfields, arrays with EXPECT_EQ.
-
-10. STRUCTURE & ISOLATION:
-Test names: TEST(TestSuite, FunctionNormalMidRange), TEST(TestSuite, FunctionMinEdgeValid), etc.
-Test fixture naming: Use correct class names (CBlynkTest for c_blynk, CLedTest for c_led).
-SetUp/TearDown: ALWAYS present in test fixtures. Full mock reset in BOTH. Minimal if no state.
-NO unnecessary extern declarations (remove extern main, etc.).
-
-QUALITY SELF-CHECK (DO INTERNALLY BEFORE OUTPUT):
-Compiles? (No duplicates, exact sigs) Yes/No - if No, fix.
-Realistic? (Values match source ranges, allow valid negatives) Yes/No.
-Meaningful? (Assertions match source logic exactly, cover branches) Yes/No.
-Source Analysis? (Expected outputs exist in source, member variables set, bugs detected) Yes/No.
-Mocks? (Only externals, NEVER the class under test, full reset) Yes/No.
-Coverage? (All branches, no gaps/redundancy) Yes/No.
-Architecture? (Tests real implementation, not mocks) Yes/No.
-Deterministic? (Skip untestable parts) Yes/No.
-Compile without additional mocks? Yes/No.
-Each test influences code under test? Yes/No.
-Senior C++ reviewer accept? Yes/No.
-
-VALIDATION FEEDBACK (CRITICAL - ADDRESS THESE SPECIFIC ISSUES):
-{validation_feedback_section}
-
-FINAL INSTRUCTION:
-Generate ONLY the complete test_{source_name}.cpp C++ code now. Follow EVERY rule strictly. Output nothing else.
+Generate ONLY the complete test_{source_name}.cpp file now.
+Do not explain. Do not apologize. Do not add commentary.
 """
         return prompt
 
