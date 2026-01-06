@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, List
 
 import requests
-import google.generativeai as genai
+import google.genai as genai
 
 from ai_c_test_analyzer.analyzer import DependencyAnalyzer
 
@@ -20,9 +20,10 @@ class SmartTestGenerator:
 
     def __init__(self, api_key: str, repo_path: str = '.', redact_sensitive: bool = False, max_api_retries: int = 5, model_choice: str = 'ollama'):
         if model_choice == 'gemini' and api_key:
-            genai.configure(api_key=api_key)
+            self.client = genai.Client(api_key=api_key)
             self._genai_configured = True
         else:
+            self.client = None
             self._genai_configured = False
         
         self.api_key = api_key
@@ -148,9 +149,8 @@ class SmartTestGenerator:
             for model_name in gemini_models:
                 try:
                     print(f"[INFO] [INIT] Trying Gemini model: {model_name}", flush=True)
-                    self.model = genai.GenerativeModel(model_name)
                     # Test the model with a simple request
-                    test_response = self.model.generate_content("test", generation_config=genai.types.GenerationConfig(max_output_tokens=10))
+                    test_response = self.client.models.generate_content(model=model_name, contents="test", config=genai.GenerateContentConfig(max_output_tokens=10))
                     self.current_model_name = model_name
                     print(f"[PASS] [DEBUG] Using Gemini model: {self.current_model_name}", flush=True)
                     break
@@ -313,7 +313,7 @@ Syntax: Perfect C - complete statements, matching braces, semicolons, no unused 
                 try:
                     print(f"[INFO] [LLM] Sending request to Gemini...", flush=True)
                     start_time = time.time()
-                    response = self.model.generate_content(prompt)
+                    response = self.client.models.generate_content(model=self.current_model_name, contents=prompt)
                     duration = time.time() - start_time
                     print(f"[INFO] [LLM] Response received in {duration:.2f}s", flush=True)
                     return response
@@ -547,7 +547,7 @@ Syntax: Perfect C - complete statements, matching braces, semicolons, no unused 
         # Generate tests using the explicitly selected model
         response = self.call_llm(prompt)
         print(f"[SUCCESS] API response received from {self.current_model_name}", flush=True)
-        test_code = response.text.strip()
+        test_code = response.candidates[0].content.parts[0].text.strip()
 
         # POST-PROCESSING: Clean up common AI generation issues
         test_code = self._post_process_test_code(test_code, analysis, analysis['includes'])
@@ -1250,7 +1250,7 @@ Generate complete, compilable C++ test code.
         # Generate tests using AI with embedded context
         try:
             response = self._try_generate_with_fallback(prompt)
-            generated_tests = response.text
+            generated_tests = response.candidates[0].content.parts[0].text
 
             # Post-process for embedded-specific patterns
             processed_tests = self._post_process_embedded_tests(generated_tests, embedded_patterns)

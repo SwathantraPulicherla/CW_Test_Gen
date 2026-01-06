@@ -9,7 +9,7 @@ from pathlib import Path
 import json
 import requests
 
-import google.generativeai as genai
+import google.genai as genai
 
 
 class TestIntelligenceAnalyzer:
@@ -23,8 +23,8 @@ class TestIntelligenceAnalyzer:
         if self.model_choice == "gemini":
             if not api_key:
                 raise ValueError("API key required for Gemini model")
-            genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel('gemini-2.5-flash')
+            self.client = genai.Client(api_key=api_key)
+            self.current_model_name = 'gemini-2.5-flash'
         elif self.model_choice == "ollama":
             pass # Connection check happens on first call or could be added here
         else:
@@ -33,8 +33,8 @@ class TestIntelligenceAnalyzer:
     def _call_llm(self, prompt: str) -> str:
         """Call the selected LLM with the prompt"""
         if self.model_choice == "gemini":
-            response = self.model.generate_content(prompt)
-            return response.text
+            response = self.client.models.generate_content(model=self.current_model_name, contents=prompt)
+            return response.candidates[0].content.parts[0].text
         elif self.model_choice == "ollama":
             payload = {
                 "model": self.ollama_model,
