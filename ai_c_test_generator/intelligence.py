@@ -24,7 +24,7 @@ class TestIntelligenceAnalyzer:
             if not api_key:
                 raise ValueError("API key required for Gemini model")
             self.client = genai.Client(api_key=api_key)
-            self.current_model_name = 'gemini-2.5-flash'
+            self.current_model_name = 'gemini-1.5-flash'
         elif self.model_choice == "ollama":
             pass # Connection check happens on first call or could be added here
         else:

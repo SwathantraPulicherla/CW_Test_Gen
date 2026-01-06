@@ -142,15 +142,15 @@ class SmartTestGenerator:
             
             # Try Gemini models in priority order: latest -> flash
             gemini_models = [
-                'gemini-2.0-flash-exp',  # Latest experimental
-                'gemini-2.5-flash',      # Flash fallback
+                'gemini-1.5-flash',  # Stable flash model
+                'gemini-1.5-pro',    # Pro model
             ]
             
             for model_name in gemini_models:
                 try:
                     print(f"[INFO] [INIT] Trying Gemini model: {model_name}", flush=True)
                     # Test the model with a simple request
-                    test_response = self.client.models.generate_content(model=model_name, contents="test", config=genai.GenerateContentConfig(max_output_tokens=10))
+                    test_response = self.client.models.generate_content(model=model_name, contents="test")
                     self.current_model_name = model_name
                     print(f"[PASS] [DEBUG] Using Gemini model: {self.current_model_name}", flush=True)
                     break
