@@ -401,8 +401,8 @@ def main():
         for root, dirs, files in os.walk(args.repo_path):
             for file in files:
                 if file.endswith('.cpp'):  # Process .cpp files only, not .c or headers
-                    # Skip files in tests/, build/, and CMakeFiles/ directories to avoid processing generated files
-                    if any(skip_dir in root.split(os.sep) for skip_dir in ['tests', 'build', 'CMakeFiles']):
+                    # Skip files in tests/, build/, CMakeFiles/, ai_test_build/ directories to avoid processing generated files
+                    if any(skip_dir in root.split(os.sep) for skip_dir in ['tests', 'build', 'CMakeFiles', 'ai_test_build']):
                         if args.verbose:
                             print(f"[SKIP] Skipping {os.path.join(root, file)} (in build/generated directory)")
                         continue
@@ -472,6 +472,11 @@ def main():
         validation_reports = []
         regeneration_stats = {'total_regenerations': 0, 'successful_regenerations': 0}
 
+        # Mandatory Human Review Gate inputs
+        generated_test_files = []  # absolute paths
+        skipped_functions_by_file = {}  # rel_source_path -> list[{name, reason, ...}]
+        detected_hardware_deps = set()  # strings
+
         # Determine output directory (central tests/ directory at repo root)
         # Find repo root (parent of repo_path if repo_path is a subdirectory)
         repo_root = args.repo_path
@@ -495,6 +500,10 @@ def main():
             rel_path = os.path.relpath(file_path, args.repo_path)
             print(f"[PROC] Processing: {rel_path}")
             output_dirs.add(output_dir)
+
+            # Filter by specific file if requested
+            if args.file and os.path.basename(file_path) != args.file:
+                continue
 
             # Check if valid test already exists
             if args.skip_if_valid:
@@ -530,89 +539,57 @@ def main():
                 print(f"   [WARN] [WARN] No functions found in {rel_path} - skipping test generation")
                 continue
 
-            max_attempts = args.max_regeneration_attempts + 1  # +1 for initial generation
-            attempt = 0
-            successful_results = []  # Keep all successful results
+            # MANDATORY HUMAN REVIEW GATE CONTRACT:
+            # - Do NOT auto-fix or regenerate
+            # - Exactly one generation attempt per file
+            attempt = 1
+            successful_results = []
             final_validation = None
 
-            while attempt < max_attempts:
-                attempt += 1
-                try:
-                    # Generate tests for this file
-                    result = generator.generate_tests_for_file(
-                        file_path, args.repo_path, output_dir, repo_scan, final_validation if attempt > 1 else None
-                    )
+            try:
+                # Generate tests for this file
+                result = generator.generate_tests_for_file(
+                    file_path, args.repo_path, output_dir, repo_scan, None
+                )
 
-                    if not result['success']:
-                        print(f"   [ERROR] Generation failed: {result['error']}")
-                        break
+                if not result.get('success'):
+                    reason = result.get('reason') or result.get('error') or 'unknown_error'
+                    print(f"   [ERROR] Generation failed: {reason}")
+                    # Still record skipped functions/hardware deps for review.
+                    skipped_functions_by_file[rel_path] = result.get('skipped_functions', [])
+                    for dep in result.get('hardware_dependencies', []) or []:
+                        detected_hardware_deps.add(str(dep))
+                    continue
 
-                    # Validate the generated test
-                    if args.verbose:
-                        print(f"   [CHECK] Validating (attempt {attempt})...")
-                    validation_result = validator.validate_test_file(result['test_file'], file_path)
+                # Record review metadata
+                if result.get('test_file'):
+                    generated_test_files.append(result['test_file'])
+                skipped_functions_by_file[rel_path] = result.get('skipped_functions', [])
+                for dep in result.get('hardware_dependencies', []) or []:
+                    detected_hardware_deps.add(str(dep))
+                for dep in result.get('functions_that_need_stubs', []) or []:
+                    detected_hardware_deps.add(str(dep))
 
-                    # Store successful result (keep all successful attempts)
-                    successful_results.append((result, validation_result))
-                    final_validation = validation_result
+                # Validate the generated test (validation is allowed; no regeneration is performed)
+                if args.verbose:
+                    print(f"   [CHECK] Validating (single attempt)...")
+                validation_result = validator.validate_test_file(result['test_file'], file_path)
 
-                    # Check if regeneration is needed based on quality threshold
-                    quality_levels = {'low': 0, 'medium': 1, 'high': 2}
-                    current_quality_level = quality_levels.get(validation_result['quality'].lower(), 0)
-                    threshold_quality_level = quality_levels.get(args.quality_threshold.lower(), 0)
+                successful_results.append((result, validation_result))
+                final_validation = validation_result
 
-                    needs_regeneration = (
-                        args.regenerate_on_low_quality and
-                        current_quality_level < threshold_quality_level and
-                        attempt < max_attempts
-                    )
-
-                    # Print validation summary
-                    status = "[PASS]" if validation_result['compiles'] and validation_result['realistic'] else "[WARN]"
-                    quality = validation_result['quality']
-                    compiles = 'Compiles' if validation_result['compiles'] else 'Broken'
-                    realistic = 'Realistic' if validation_result['realistic'] else 'Unrealistic'
-
-                    if attempt == 1:
-                        print(f"   {status} {quality} quality ({compiles}, {realistic})")
-                    else:
-                        print(f"   {status} {quality} quality ({compiles}, {realistic}) - regenerated")
-
-                    if not validation_result['compiles'] and validation_result['issues']:
-                        print(f"   Issues: {len(validation_result['issues'])}")
-                        if args.verbose:
-                            for issue in validation_result['issues'][:3]:  # Show first 3 issues
-                                print(f"     - {issue}")
-
-                    # Store final results
-                    final_result = result
-                    final_validation = validation_result
-
-                    # Check if we should regenerate
-                    if needs_regeneration:
-                        print(f"   [INFO] Quality below threshold ({validation_result['quality']} < {args.quality_threshold.title()}), regenerating (attempt {attempt + 1}/{max_attempts})...")
-                        regeneration_stats['total_regenerations'] += 1
-                        # Remove the low-quality test file so it can be regenerated
-                        if os.path.exists(result['test_file']):
-                            os.remove(result['test_file'])
-                        continue
-                    else:
-                        # Quality is acceptable or we've reached max attempts
-                        break
-
-                except Exception as e:
-                    print(f"   [ERROR] Error processing {rel_path}: {str(e)}")
-                    break
+            except Exception as e:
+                print(f"   [ERROR] Error processing {rel_path}: {str(e)}")
+                if args.verbose:
+                    import traceback
+                    traceback.print_exc()
+                continue
 
             # Process successful results - keep the last successful one
             if successful_results:
                 final_result, final_validation = successful_results[-1]  # Keep the last (potentially best) result
                 successful_generations += 1
                 validation_reports.append(final_validation)
-
-                # Track successful regenerations
-                if attempt > 1:
-                    regeneration_stats['successful_regenerations'] += 1
 
                 print(f"   [PASS] [OK] Final: {os.path.basename(final_result['test_file'])} ({final_validation['quality']} quality)")
             else:
@@ -642,12 +619,8 @@ def main():
             if validation_reports:
                 print(f"   [SAVE] [SAVE] Reports saved in respective test directories")
 
-        # Print regeneration statistics
         if args.regenerate_on_low_quality:
-            print(f"   [INFO] [GEN] Regenerations: {regeneration_stats['successful_regenerations']}/{regeneration_stats['total_regenerations']} successful")
-            if regeneration_stats['total_regenerations'] > 0:
-                success_rate = (regeneration_stats['successful_regenerations'] / regeneration_stats['total_regenerations']) * 100
-                print(f"   [INFO] [GEN] Regeneration success rate: {success_rate:.1f}%")
+            print("[WARN] [WARN] Auto-regeneration is DISABLED by the mandatory human review gate.")
 
         # Check quality of all generated tests
         quality_levels = {'low': 0, 'medium': 1, 'high': 2}
@@ -697,15 +670,88 @@ def main():
             except Exception:
                 pass
 
-        # Print final success message
+        # Mandatory Human Review Gate: write review artifacts and STOP.
+        review_dir = os.path.join(output_dir, "review")
+        os.makedirs(review_dir, exist_ok=True)
+
+        # Review artifacts
+        review_required_path = os.path.join(review_dir, "review_required.md")
+        hardware_deps_path = os.path.join(review_dir, "hardware_dependencies.txt")
+        skipped_path = os.path.join(review_dir, "skipped_functions.txt")
+
+        # Normalize paths for readability
+        repo_root_abs = os.path.abspath(repo_root)
+        generated_rel = [os.path.relpath(os.path.abspath(p), repo_root_abs) for p in generated_test_files]
+        generated_rel = [p.replace('\\', '/') for p in generated_rel]
+
+        with open(hardware_deps_path, "w", encoding="utf-8") as f:
+            for dep in sorted(detected_hardware_deps):
+                f.write(f"{dep}\n")
+
+        with open(skipped_path, "w", encoding="utf-8") as f:
+            for src_rel, skipped_list in sorted(skipped_functions_by_file.items()):
+                if not skipped_list:
+                    continue
+                f.write(f"{src_rel}\n")
+                for item in skipped_list:
+                    name = item.get('name', '').strip()
+                    reason = item.get('reason', '').strip()
+                    if name:
+                        f.write(f"  - {name}: {reason}\n")
+
+        with open(review_required_path, "w", encoding="utf-8") as f:
+            f.write("# Manual Review Required\n\n")
+            f.write("This repository contains AI-generated test code. **Human review is mandatory before any build/test execution.**\n\n")
+            f.write("## Generated test files\n")
+            if generated_rel:
+                for p in generated_rel:
+                    f.write(f"- {p}\n")
+            else:
+                f.write("- (none)\n")
+
+            f.write("\n## Skipped functions (with reasons)\n")
+            any_skipped = any(bool(v) for v in skipped_functions_by_file.values())
+            if any_skipped:
+                for src_rel, skipped_list in sorted(skipped_functions_by_file.items()):
+                    if not skipped_list:
+                        continue
+                    f.write(f"- {src_rel}\n")
+                    for item in skipped_list:
+                        name = item.get('name', '').strip()
+                        reason = item.get('reason', '').strip()
+                        if name:
+                            f.write(f"  - {name}: {reason}\n")
+            else:
+                f.write("- (none)\n")
+
+            f.write("\n## Hardware dependencies detected\n")
+            if detected_hardware_deps:
+                for dep in sorted(detected_hardware_deps):
+                    f.write(f"- {dep}\n")
+            else:
+                f.write("- (none)\n")
+
+            f.write("\n## Known limitations / assumptions\n")
+            f.write("- Generated tests are AI-produced and may contain incorrect assumptions; review is required.\n")
+            f.write("- No compilation/build/test execution is performed until approval is recorded.\n")
+            f.write("- Hardware-dependent behavior is not simulated; hardware-touching functions may be skipped or require stubs/mocks.\n")
+            f.write("\n## Approval gate\n")
+            f.write("Create an approval file for EACH generated test file before building or running tests:\n\n")
+            if generated_rel:
+                f.write("Required approval files:\n")
+                for p in generated_rel:
+                    approval_name = f"APPROVED.{os.path.basename(p)}.flag"
+                    f.write(f"- tests/review/{approval_name}\n")
+                f.write("\n")
+            f.write("Each approval file contents must be exactly:\n\n")
+            f.write("approved = true\n")
+            f.write("reviewed_by = <human_name>\n")
+            f.write("date = <ISO date>\n")
+
         print("[DONE] [SUCCESS] Test generation completed!")
-        print(f"   [STATS] [STATS] Generated: {successful_generations}/{len(c_files)} files")
-        print(f"   [INFO] [OUTPUT] Tests saved to: {os.path.relpath(output_dir)}")
-        if validation_reports:
-            print(f"   [INFO] [REPORTS] Validation reports saved to: {os.path.relpath(os.path.join(output_dir, 'compilation_report'))}")
-        if regeneration_stats['total_regenerations'] > 0:
-            success_rate = (regeneration_stats['successful_regenerations'] / regeneration_stats['total_regenerations']) * 100
-            print(f"   [INFO] [REGEN] Success rate: {success_rate:.1f}% ({regeneration_stats['successful_regenerations']}/{regeneration_stats['total_regenerations']})")
+        print(f"   [INFO] Review artifact written: {os.path.relpath(review_required_path, repo_root)}")
+        print("⛔ Manual review required before build.")
+        sys.exit(0)
 
     except KeyboardInterrupt:
         print("\n[STOP] Interrupted by user")

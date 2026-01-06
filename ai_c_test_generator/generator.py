@@ -416,14 +416,39 @@ Syntax: Perfect C - complete statements, matching braces, semicolons, no unused 
         analyzer = DependencyAnalyzer(repo_path)
         
         # Get structured analysis (Stage 0)
-        file_analysis_json = analyzer.get_file_analysis(file_path, repo_scan)
+        scan_results = repo_scan if isinstance(repo_scan, dict) and 'function_index' in repo_scan else None
+        file_analysis_json = analyzer.get_file_analysis(file_path, scan_results)
         
         # Filter for testable functions
-        testable_functions = [f for f in file_analysis_json['functions'] if f['testable']]
+        testable_functions = [f for f in file_analysis_json['functions'] if f.get('testable')]
+        skipped_functions = [
+            {
+                'name': f.get('name', ''),
+                'reason': f.get('reason', 'Not testable'),
+                'category': f.get('category', 'unknown'),
+                'hardware_calls': f.get('hardware_calls', []),
+            }
+            for f in file_analysis_json.get('functions', [])
+            if not f.get('testable')
+        ]
+
+        hardware_dependencies = set()
+        for f in file_analysis_json.get('functions', []):
+            for hw in (f.get('hardware_calls') or []):
+                if hw:
+                    hardware_dependencies.add(str(hw))
         
         if not testable_functions:
              print(f"[SKIP] {os.path.basename(file_path)} has no testable functions.")
-             return {'success': False, 'reason': 'no_testable_functions'}
+             return {
+                 'success': False,
+                 'reason': 'no_testable_functions',
+                 'test_file': None,
+                 'functions_that_need_stubs': [],
+                 'functions_to_include_directly': [],
+                 'skipped_functions': skipped_functions,
+                 'hardware_dependencies': sorted(hardware_dependencies),
+             }
 
         # Legacy analysis for prompt construction (includes, stubs, etc.)
         # Handle both repo-scan mode and single-file mode
@@ -546,7 +571,19 @@ Syntax: Perfect C - complete statements, matching braces, semicolons, no unused 
             f.write(test_code)
         
         print(f"[SUCCESS] Test saved to {output_path}", flush=True)
-        return {'success': True, 'test_file': output_path}
+        # Add dependency context to returned metadata for downstream review artifacts.
+        for dep in functions_that_need_stubs:
+            if dep:
+                hardware_dependencies.add(str(dep))
+
+        return {
+            'success': True,
+            'test_file': output_path,
+            'functions_that_need_stubs': functions_that_need_stubs,
+            'functions_to_include_directly': functions_to_include_directly,
+            'skipped_functions': skipped_functions,
+            'hardware_dependencies': sorted(hardware_dependencies),
+        }
 
     def _build_targeted_prompt(self, analysis: Dict, functions_that_need_stubs: List[str], functions_to_include_directly: List[str], repo_path: str, validation_feedback: Dict = None) -> str:
         """Build targeted prompt based on detected programming language"""
