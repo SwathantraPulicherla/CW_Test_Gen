@@ -4,6 +4,8 @@ Test Validator - Validates generated test files
 
 import os
 import re
+import sys
+import datetime
 from typing import Dict, List
 
 from ai_c_test_analyzer.analyzer import DependencyAnalyzer
@@ -23,6 +25,8 @@ class TestValidator:
         validation_result = {
             'file': os.path.basename(test_file_path),
             'test_file': test_file_path,
+            'source_file': source_file_path,
+            'source_rel': None,
             'compiles': True,
             'realistic': True,
             'quality': 'High',
@@ -31,6 +35,12 @@ class TestValidator:
             'fix': [],
             'remove': []
         }
+
+        # Best-effort: record repo-relative source path so reports can mirror source structure.
+        try:
+            validation_result['source_rel'] = os.path.relpath(os.path.abspath(source_file_path), os.path.abspath(self.repo_path)).replace('\\', '/')
+        except Exception:
+            validation_result['source_rel'] = None
 
         try:
             # Read both files
@@ -97,11 +107,20 @@ class TestValidator:
                     result['issues'].append(f"Missing required Google Test include: #include <gtest/gtest.h>")
                     result['compiles'] = False
 
+        # Repo integration rule: when linking against gtest_main, tests must NOT define main().
+        # (Defining main in the test file will cause duplicate symbol / link errors.)
+        if is_gtest and re.search(r'\bint\s+main\s*\(', test_content):
+            result['issues'].append("GoogleTest file defines int main(...). This repo links gtest_main; remove the custom main().")
+            result['compiles'] = False
+
         # Check for invalid includes (headers that don't exist)
         invalid_includes = []
         include_pattern = re.compile(r'#include\s+["<]([^">]+)[">]')
         # Common standard C library headers that are acceptable in tests
-        standard_headers = {'stdio.h', 'stdlib.h', 'string.h', 'math.h', 'assert.h', 'ctype.h', 'errno.h', 'limits.h', 'stdarg.h', 'stddef.h', 'stdint.h', 'stdbool.h', 'time.h', 'iostream', 'string', 'vector', 'map', 'algorithm'}
+        standard_headers = {
+            'stdio.h', 'stdlib.h', 'string.h', 'math.h', 'assert.h', 'ctype.h', 'errno.h', 'limits.h', 'stdarg.h', 'stddef.h', 'stdint.h', 'stdbool.h', 'time.h',
+            'iostream', 'string', 'vector', 'map', 'algorithm', 'array', 'utility', 'tuple', 'memory', 'type_traits', 'limits', 'cstdint', 'cstddef', 'cstring',
+        }
         
         for match in include_pattern.finditer(test_content):
             header = match.group(1)
@@ -475,14 +494,45 @@ class TestValidator:
 
     def save_validation_report(self, report: Dict, report_dir: str):
         """Save validation report to file"""
-        os.makedirs(report_dir, exist_ok=True)
+        # Mirror source folder structure under compilation_report for easier browsing.
+        # Example: source_rel=src/logic/Interlocking.cpp -> tests/compilation_report/src/logic/test_Interlocking_compiles_yes.txt
+        dest_dir = report_dir
+        source_rel = (report.get('source_rel') or '').replace('\\', '/')
+        if source_rel and not source_rel.startswith('..'):
+            try:
+                parent = os.path.dirname(source_rel)
+                if parent and parent != '.':
+                    dest_dir = os.path.join(report_dir, parent)
+            except Exception:
+                dest_dir = report_dir
 
-        base_name = os.path.splitext(report['file'])[0]
+        os.makedirs(dest_dir, exist_ok=True)
+
+        # Use the test filename stem so it stays stable even when source structure changes.
+        base_name = os.path.splitext(os.path.basename(report.get('test_file') or report['file']))[0]
         compiles_status = "compiles_yes" if report['compiles'] else "compiles_no"
         filename = f"{base_name}_{compiles_status}.txt"
-        filepath = os.path.join(report_dir, filename)
+        filepath = os.path.join(dest_dir, filename)
 
-        with open(filepath, 'w') as f:
+        def _unique_path(path: str) -> str:
+            root, ext = os.path.splitext(path)
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            candidate = f"{root}_{stamp}{ext}"
+            i = 2
+            while os.path.exists(candidate):
+                candidate = f"{root}_{stamp}_{i}{ext}"
+                i += 1
+            return candidate
+
+        if os.path.exists(filepath):
+            overwrite = False
+            if sys.stdin.isatty():
+                ans = input(f"Validation report already exists: {os.path.basename(filepath)}. Replace? (y/n): ").strip().lower()
+                overwrite = (ans == 'y')
+            if not overwrite:
+                filepath = _unique_path(filepath)
+
+        with open(filepath, 'w', encoding='utf-8') as f:
             f.write(f"Validation Report for {report['file']}\n")
             f.write(f"Quality: {report['quality']}\n")
             f.write(f"Compiles: {report['compiles']}\n")
@@ -506,3 +556,5 @@ class TestValidator:
                 f.write("\nRemove:\n")
                 for item in report['remove']:
                     f.write(f"- {item}\n")
+
+        return filepath

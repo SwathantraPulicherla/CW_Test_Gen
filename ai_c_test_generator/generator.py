@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Dict, List
 
 import requests
-import google.generativeai as genai
+import google.genai as genai
 
 from ai_c_test_analyzer.analyzer import DependencyAnalyzer
 
@@ -18,11 +18,20 @@ from ai_c_test_analyzer.analyzer import DependencyAnalyzer
 class SmartTestGenerator:
     """AI-powered test generator using Ollama with embedded systems support"""
 
-    def __init__(self, api_key: str, repo_path: str = '.', redact_sensitive: bool = False, max_api_retries: int = 5, model_choice: str = 'ollama'):
+    def __init__(
+        self,
+        api_key: str,
+        repo_path: str = '.',
+        redact_sensitive: bool = False,
+        max_api_retries: int = 5,
+        model_choice: str = 'ollama',
+        enable_gmock: bool = False,
+    ):
         if model_choice == 'gemini' and api_key:
-            genai.configure(api_key=api_key)
+            self.client = genai.Client(api_key=api_key)
             self._genai_configured = True
         else:
+            self.client = None
             self._genai_configured = False
         
         self.api_key = api_key
@@ -30,6 +39,7 @@ class SmartTestGenerator:
         self.redact_sensitive = redact_sensitive
         self.max_api_retries = max_api_retries
         self.model_choice = model_choice
+        self.enable_gmock = enable_gmock
 
         # Models
         self.current_model_name = None
@@ -131,7 +141,7 @@ class SmartTestGenerator:
                 duration = time.time() - start_time
                 
                 self.current_model_name = f"ollama:{self.ollama_model}"
-                print(f"[PASS] [DEBUG] Ollama model '{self.ollama_model}' initialized in {duration:.2f}s", flush=True)
+                print(f"ℹ️ [DEBUG] Ollama model '{self.ollama_model}' initialized in {duration:.2f}s", flush=True)
             except Exception as e:
                 raise RuntimeError(f"Ollama model not available: {e}. Make sure Ollama is running and the model is installed.")
         
@@ -141,21 +151,31 @@ class SmartTestGenerator:
             
             # Try Gemini models in priority order: latest -> flash
             gemini_models = [
-                'gemini-2.0-flash-exp',  # Latest experimental
+                'gemini-3-flash',        # Latest Flash model
                 'gemini-2.5-flash',      # Flash fallback
             ]
             
             for model_name in gemini_models:
                 try:
                     print(f"[INFO] [INIT] Trying Gemini model: {model_name}", flush=True)
-                    self.model = genai.GenerativeModel(model_name)
                     # Test the model with a simple request
-                    test_response = self.model.generate_content("test", generation_config=genai.types.GenerationConfig(max_output_tokens=10))
+                    # NOTE: Avoid passing a config object here because the google-genai
+                    # package API surface varies by version (and may not expose
+                    # GenerateContentConfig at module top-level). A minimal request is
+                    # sufficient to validate auth/model availability.
+                    _ = self.client.models.generate_content(
+                        model=model_name,
+                        contents="test",
+                    )
                     self.current_model_name = model_name
-                    print(f"[PASS] [DEBUG] Using Gemini model: {self.current_model_name}", flush=True)
+                    # Preserve legacy attribute shape: older implementations set
+                    # self.model to a GenerativeModel instance. With google-genai
+                    # we keep self.model as the selected model id.
+                    self.model = model_name
+                    print(f"✅ [DEBUG] Using Gemini model: {self.current_model_name}", flush=True)
                     break
                 except Exception as e:
-                    print(f"[WARN] Failed to initialize {model_name}: {e}")
+                    print(f"⚠️ Failed to initialize {model_name}: {e}")
                     continue
             else:
                 raise RuntimeError("Failed to initialize any Gemini model. Check your API key, internet connection, and quota limits.")
@@ -208,8 +228,8 @@ class SmartTestGenerator:
             raise ValueError("Invalid model choice. Must be 'ollama', 'gemini', 'groq', or 'github'.")
 
 
-        if self.model_choice == 'gemini' and self.model is None:
-            raise Exception("No compatible Gemini model found. Please check your API key and internet connection.")
+        if self.model_choice == 'gemini' and not self.current_model_name:
+            raise RuntimeError("No compatible Gemini model found. Please check your API key and internet connection.")
 
     def _load_unity_prompts(self):
         """Load Unity C test generation prompts from ai-tool-gen-lab"""
@@ -313,7 +333,10 @@ Syntax: Perfect C - complete statements, matching braces, semicolons, no unused 
                 try:
                     print(f"[INFO] [LLM] Sending request to Gemini...", flush=True)
                     start_time = time.time()
-                    response = self.model.generate_content(prompt)
+                    response = self.client.models.generate_content(
+                        model=self.current_model_name,
+                        contents=prompt
+                    )
                     duration = time.time() - start_time
                     print(f"[INFO] [LLM] Response received in {duration:.2f}s", flush=True)
                     return response
@@ -406,12 +429,22 @@ Syntax: Perfect C - complete statements, matching braces, semicolons, no unused 
 
     def build_dependency_map(self, repo_path: str) -> Dict:
         """Build comprehensive repo scan for dependency analysis"""
-        analyzer = DependencyAnalyzer(repo_path)
-        return analyzer.perform_repo_scan()
+        import json
+        from pathlib import Path
+        
+        analysis_file = Path(repo_path) / 'tests' / 'analysis' / 'analysis.json'
+        if analysis_file.exists():
+            print(f"ℹ️ Reusing existing analysis from {analysis_file}")
+            with open(analysis_file, 'r') as f:
+                return json.load(f)
+        else:
+            print("🔍 No existing analysis found, performing fresh repo scan...")
+            analyzer = DependencyAnalyzer(repo_path)
+            return analyzer.perform_repo_scan()
 
     def generate_tests_for_file(self, file_path: str, repo_path: str, output_dir: str, repo_scan: Dict, validation_feedback: Dict = None) -> Dict:
         """Generate tests for a SINGLE file with proper context from repo scan"""
-        print(f"[INFO] Generating tests for {os.path.basename(file_path)}...", flush=True)
+        print(f"🤖 Generating tests for {os.path.basename(file_path)}...", flush=True)
         
         analyzer = DependencyAnalyzer(repo_path)
         
@@ -546,7 +579,7 @@ Syntax: Perfect C - complete statements, matching braces, semicolons, no unused 
 
         # Generate tests using the explicitly selected model
         response = self.call_llm(prompt)
-        print(f"[SUCCESS] API response received from {self.current_model_name}", flush=True)
+        print(f"✅ API response received from {self.current_model_name}", flush=True)
         test_code = response.text.strip()
 
         # POST-PROCESSING: Clean up common AI generation issues
@@ -562,15 +595,24 @@ Syntax: Perfect C - complete statements, matching braces, semicolons, no unused 
             test_code = test_code.replace('#include <gtest/gtest.h>\n', '')
             test_code = test_code.replace('#include <gtest/gtest.h>', '')
 
-        # Save test file
-        test_filename = f"test_{os.path.basename(file_path)}"
-        output_path = os.path.join(output_dir, test_filename)
+        # Save test file (mirror repo-relative source folder structure under <repo>/tests/)
+        repo_root = Path(repo_path).resolve()
+        src_path = Path(file_path).resolve()
+        out_base = Path(output_dir)
+        if not out_base.is_absolute():
+            out_base = repo_root / out_base
 
-        os.makedirs(output_dir, exist_ok=True)
-        with open(output_path, 'w') as f:
-            f.write(test_code)
-        
-        print(f"[SUCCESS] Test saved to {output_path}", flush=True)
+        try:
+            source_rel = src_path.relative_to(repo_root)
+        except Exception:
+            source_rel = Path(src_path.name)
+
+        test_filename = f"test_{src_path.name}"
+        output_path = out_base / source_rel.parent / test_filename
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(test_code, encoding="utf-8", newline="\n")
+
+        print(f"✅ Test saved to {output_path}", flush=True)
         # Add dependency context to returned metadata for downstream review artifacts.
         for dep in functions_that_need_stubs:
             if dep:
@@ -578,7 +620,7 @@ Syntax: Perfect C - complete statements, matching braces, semicolons, no unused 
 
         return {
             'success': True,
-            'test_file': output_path,
+            'test_file': str(output_path),
             'functions_that_need_stubs': functions_that_need_stubs,
             'functions_to_include_directly': functions_to_include_directly,
             'skipped_functions': skipped_functions,
@@ -672,6 +714,8 @@ ARDUINO/ESP32 TESTING STANDARDS (MANDATORY):
         if 'structured_analysis' in analysis:
             structured_analysis_json = json.dumps(analysis['structured_analysis'], indent=2)
 
+        gmock_mode = "ENABLED" if self.enable_gmock else "DISABLED"
+
         prompt = f"""
 You are an expert C++ unit test generation agent for embedded systems.
 
@@ -691,6 +735,25 @@ The tool’s scope is:
 • NEVER monkey-patch C++ methods
 
 If a function cannot be tested deterministically on host (even with stubs), it MUST be skipped.
+
+========================
+ANTI-HALLUCINATION CONTRACT (MANDATORY)
+========================
+
+You MUST strictly follow the repository's real source code and headers.
+
+FORBIDDEN (these are the exact failure modes to avoid):
+
+❌ Inventing enums/structs/classes/methods that do not exist in the repo
+❌ Renaming or "simplifying" existing repo types (e.g., changing return types or enum members)
+❌ Re-declaring/duplicating repo types inside the test file (especially inside the same namespaces)
+❌ Creating "self-contained" fake headers or fake type systems that contradict the real headers
+❌ Pasting or re-implementing production .cpp code into the test file
+
+REQUIRED:
+✅ Use ONLY types/functions that appear in the provided SOURCE CODE and/or included repo headers
+✅ Include the real repo headers and write tests against the real compiled implementation
+✅ If you cannot determine an exact signature/type from the provided source+headers, SKIP that function
 
 ========================
 ABSOLUTE C++ RULES
@@ -762,6 +825,24 @@ Use these rules:
 Prefer REAL compilation over stubbing whenever possible.
 
 ========================
+GMOCK POLICY (STRICT)
+========================
+
+GoogleMock (gmock) mode for this run: {gmock_mode}
+
+If gmock mode is DISABLED:
+❌ Do NOT include <gmock/gmock.h>
+❌ Do NOT use MOCK_METHOD / EXPECT_CALL / NiceMock
+✅ Use compile-time stubs, link seams, or simple fakes WITHOUT redefining repo production types
+
+If gmock mode is ENABLED:
+✅ You MAY use gmock ONLY for REAL virtual interface types that already exist in the repo headers.
+✅ You MUST include the real header that declares the interface.
+❌ Do NOT invent "interfaces" for concrete classes.
+❌ Do NOT create replacement classes in the same namespace as production types.
+If a dependency is a concrete class (non-virtual), prefer fakes or real instances; do not force gmock.
+
+========================
 WHAT TO GENERATE
 ========================
 
@@ -788,6 +869,8 @@ WHAT NOT TO GENERATE
 ❌ Trivial tests that assert nothing
 ❌ Arbitrary values not derived from source
 ❌ Tests for skipped functions
+❌ Any re-definition of repo types to make compilation "easier"
+❌ Any "assumed" enum members (e.g., RED/YELLOW/GREEN) that are not present in the repo
 
 ========================
 OUTPUT FORMAT (STRICT)
@@ -798,11 +881,13 @@ Output ONLY valid C++ code.
 Structure must be:
 
 1. /* test_{source_name}.cpp – Auto-generated Expert Google Test Tests */
-2. Includes (<gtest/gtest.h>, <stdint.h>, etc.)
+2. Includes (<gtest/gtest.h>, <cstdint>, etc.)
 3. Test fixture (SetUp/TearDown public)
 4. Tests
-5. main() with RUN_ALL_TESTS()
-6. Final comment listing skipped functions
+5. Final comment listing skipped functions
+
+CRITICAL (THIS REPO'S BUILD):
+❌ Do NOT define int main(...). These tests link against gtest_main, which already provides main().
 
 NO markdown
 NO explanations
@@ -1042,6 +1127,10 @@ Generate ONLY the complete test_{source_name}.c C code now. Follow EVERY rule st
     def _post_process_test_code(self, test_code: str, analysis: Dict, source_includes: List[str]) -> str:
         """Post-process generated test code to fix common issues and improve quality"""
 
+        file_path = analysis.get('file_path', '')
+        language = self._detect_language(file_path) if file_path else 'cpp'
+        is_cpp = language != 'c'
+
         # Remove markdown code block markers
         test_code = re.sub(r'^```c?\s*', '', test_code, flags=re.MULTILINE)
         test_code = re.sub(r'```\s*$', '', test_code, flags=re.MULTILINE)
@@ -1081,10 +1170,58 @@ Generate ONLY the complete test_{source_name}.c C code now. Follow EVERY rule st
         lines = test_code.split("\n")
         cleaned_lines = []
 
+        # Allow a conservative set of standard headers to remain in generated tests.
+        # Keep this language-sensitive so we don't accidentally emit C++ headers in C tests.
+        if is_cpp:
+            allowed_std_headers = {
+                "cstdint",
+                "cstddef",
+                "cinttypes",
+                "limits",
+                "cstring",
+                "string",
+                "vector",
+                "array",
+                "algorithm",
+                "utility",
+                "tuple",
+                "type_traits",
+                "memory",
+                "cmath",
+                "cstdio",
+                "cstdlib",
+                "cassert",
+                # Common C headers that might appear in mixed C/C++ code
+                "stdint.h",
+                "stddef.h",
+                "limits.h",
+                "string.h",
+            }
+        else:
+            allowed_std_headers = {
+                "stdint.h",
+                "stdbool.h",
+                "stddef.h",
+                "limits.h",
+                "string.h",
+                "math.h",
+                "stdio.h",
+                "stdlib.h",
+                "assert.h",
+            }
+
         for line in lines:
             # Keep gtest.h include
             if "#include <gtest/gtest.h>" in line:
                 cleaned_lines.append(line)
+                continue
+
+            # Keep integer headers appropriate for the test language.
+            if "#include <stdint.h>" in line and is_cpp:
+                cleaned_lines.append("#include <cstdint>")
+                continue
+            if "#include <cstdint>" in line and not is_cpp:
+                cleaned_lines.append("#include <stdint.h>")
                 continue
 
             # Only keep includes for headers that exist in source_includes or are standard headers
@@ -1093,7 +1230,11 @@ Generate ONLY the complete test_{source_name}.c C code now. Follow EVERY rule st
                 if include_match:
                     header_name = include_match.group(1)
                     # Only include headers that exist in source_includes or are standard headers
-                    if header_name in source_includes or header_name.endswith(".h"):
+                    if (
+                        header_name in source_includes
+                        or header_name.endswith((".h", ".hpp"))
+                        or header_name in allowed_std_headers
+                    ):
                         # Additional check: don't include main.h if it doesn't exist
                         if header_name == "main.h" and not any("main.h" in inc for inc in source_includes):
                             continue
@@ -1104,12 +1245,13 @@ Generate ONLY the complete test_{source_name}.c C code now. Follow EVERY rule st
             # Keep all other lines
             cleaned_lines.append(line)
 
-        # Ensure gtest.h is included if not present
-        has_gtest = any("#include <gtest/gtest.h>" in line for line in cleaned_lines)
-        if not has_gtest:
-            cleaned_lines.insert(0, "#include <gtest/gtest.h>")
+        # Ensure gtest is included for C++/GTest outputs; do not force it for C/Unity.
+        if is_cpp:
+            has_gtest = any("#include <gtest/gtest.h>" in line for line in cleaned_lines)
+            if not has_gtest:
+                cleaned_lines.insert(0, "#include <gtest/gtest.h>")
 
-        # Add Google Test main function with test discovery
+        # Join cleaned lines; do NOT inject a custom main() (we link gtest_main).
         test_code_with_main = "\n".join(cleaned_lines)
         
         # Check if Arduino.h is included (directly or indirectly)
@@ -1127,12 +1269,14 @@ Generate ONLY the complete test_{source_name}.c C code now. Follow EVERY rule st
              # But usually we WANT mocks for testing. The issue is redefinition of the BASE classes.
              # If Arduino_stubs.h defines String, we shouldn't define it again.
 
-        test_functions = re.findall(r'TEST\s*\(\s*\w+\s*,\s*\w+\s*\)', test_code_with_main)
-
-        if test_functions and "int main(" not in test_code_with_main:
-            main_function = "\n\nint main(int argc, char **argv) {\n    ::testing::InitGoogleTest(&argc, argv);\n    return RUN_ALL_TESTS();\n}"
-
-            test_code_with_main += main_function
+        # Defensive cleanup: if the model emitted a gtest runner main anyway, strip it.
+        # (Our CMake setup links gtest_main; defining main in tests causes link errors.)
+        test_code_with_main = re.sub(
+            r"\n\s*int\s+main\s*\([^)]*\)\s*\{\s*::testing::InitGoogleTest\([^;]*;\s*return\s+RUN_ALL_TESTS\(\)\s*;\s*\}\s*",
+            "\n",
+            test_code_with_main,
+            flags=re.DOTALL,
+        )
 
         return test_code_with_main
 
@@ -1195,6 +1339,7 @@ Generate ONLY the complete test_{source_name}.c C code now. Follow EVERY rule st
         base_prompt += """
 Requirements:
 - Use Google Test framework (gtest)
+    - Do NOT define int main(...). The build links gtest_main, which provides main().
 - Include SetUp() and TearDown() functions in test fixtures
 - Test realistic embedded values and edge cases
 - Handle volatile variables correctly
@@ -1255,6 +1400,17 @@ Generate complete, compilable C++ test code.
             # Post-process for embedded-specific patterns
             processed_tests = self._post_process_embedded_tests(generated_tests, embedded_patterns)
 
+            # Keep generation loops consistent with the rest of this repo:
+            # - Prefer <cstdint> over <stdint.h>
+            # - Never define a custom GoogleTest main()
+            processed_tests = processed_tests.replace('#include <stdint.h>', '#include <cstdint>')
+            processed_tests = re.sub(
+                r"\n\s*int\s+main\s*\([^)]*\)\s*\{\s*::testing::InitGoogleTest\([^;]*;\s*return\s+RUN_ALL_TESTS\(\)\s*;\s*\}\s*",
+                "\n",
+                processed_tests,
+                flags=re.DOTALL,
+            )
+
             # Validate and enhance tests
             validated_tests = self.validator.validate_and_enhance_tests(
                 processed_tests, source_code, function_name, embedded_patterns
@@ -1263,5 +1419,5 @@ Generate complete, compilable C++ test code.
             return validated_tests
 
         except Exception as e:
-            print(f"[ERROR] Test generation failed: {e}")
+            print(f"❌ Test generation failed: {e}")
             return ""

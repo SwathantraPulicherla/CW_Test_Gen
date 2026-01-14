@@ -26,6 +26,17 @@ from .validator import TestValidator
 from ai_c_test_analyzer.analyzer import DependencyAnalyzer
 
 
+class Colors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\032[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+
+
 def create_parser():
     """Create argument parser for the CLI tool"""
     parser = argparse.ArgumentParser(
@@ -179,6 +190,12 @@ Examples:
         help='Path to pre-computed analysis JSON file (for generate mode)'
     )
 
+    parser.add_argument(
+        '--enable-gmock',
+        action='store_true',
+        help='Opt-in: allow GoogleMock (gmock) generation ONLY when the repo exposes real virtual interfaces. Default: disabled (use compile-time stubs/fakes).'
+    )
+
     return parser
 
 
@@ -247,6 +264,20 @@ def validate_environment(args):
 
 def main():
     """Main CLI entry point"""
+    # Ensure Unicode output works on Windows consoles that default to a legacy codepage.
+    # Prevents crashes when printing emojis / box-drawing characters.
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+    print(f"\n{Colors.BOLD}{'='*70}")
+    print(f"   AI-ASSISTED UNIT TEST GENERATION - LIVE DEMO")
+    print(f"{'='*70}{Colors.ENDC}\n")
+    
     print("[INFO] [DEBUG] CLI started, parsing args...")
     parser = create_parser()
     args = parser.parse_args()
@@ -301,7 +332,7 @@ def main():
             with open(output_path, 'w') as f:
                 json.dump(scan_results, f, default=set_default, indent=2)
                 
-            print(f"[SUCCESS] Analysis saved to {output_path}")
+            print(f"✅ Analysis saved to {output_path}")
             sys.exit(0)
         except Exception as e:
             print(f"[ERROR] Analysis failed: {e}")
@@ -364,8 +395,10 @@ def main():
             args.repo_path,
             redact_sensitive=args.redact_sensitive,
             max_api_retries=args.max_api_retries,
-            model_choice=args.model
+            model_choice=args.model,
+            enable_gmock=args.enable_gmock,
         )
+        print(f"🤖 [MODEL] Using AI model: {generator.current_model_name}")
         validator = TestValidator(args.repo_path)
 
         # Build repo scan
@@ -396,9 +429,96 @@ def main():
         else:
             print("[INFO] [DEBUG] Skipping global repo scan for single file mode", flush=True)
 
-        # Find C files in entire repository (excluding tests/, build/, and CMakeFiles/ directories)
+        # Log analysis source prominently
+        if args.analysis_file:
+            print(f"[ANALYSIS] Loaded from file: {args.analysis_file}")
+        elif not args.file:
+            analysis_path = os.path.join(args.repo_path, 'tests', 'analysis', 'analysis.json')
+            if os.path.exists(analysis_path):
+                print(f"[ANALYSIS] Reused cached analysis: {analysis_path}")
+            else:
+                print("[ANALYSIS] Performed fresh repo scan (no cache found)")
+        else:
+            print("[ANALYSIS] Single-file mode (no global analysis)")
+
+        def _resolve_selected_file() -> str:
+            """Resolve args.file to an absolute path.
+
+            Accepts:
+            - absolute paths
+            - paths relative to repo root
+            - paths relative to repo/src (common when callers omit 'src/')
+            - paths relative to --source-dir
+            """
+            if not args.file:
+                return ""
+
+            candidate_inputs = [args.file]
+            # If user provided a Windows-style path in a quoted arg, it may contain '/' or '\\'.
+            # os.path.normpath will normalize either.
+            candidate_inputs = [os.path.normpath(p) for p in candidate_inputs]
+
+            bases = []
+            bases.append(args.repo_path)
+            bases.append(os.path.join(args.repo_path, "src"))
+            if args.source_dir:
+                bases.append(os.path.join(args.repo_path, os.path.normpath(args.source_dir)))
+
+            # 1) Direct absolute path
+            for raw in candidate_inputs:
+                if os.path.isabs(raw) and os.path.exists(raw):
+                    return os.path.abspath(raw)
+
+            # 2) Relative to known bases
+            for raw in candidate_inputs:
+                for base in bases:
+                    candidate = os.path.abspath(os.path.join(base, raw))
+                    if os.path.exists(candidate):
+                        return candidate
+
+            # 3) Fallback: match by basename within scan scope (only if unique)
+            wanted_base = os.path.basename(candidate_inputs[0])
+            matches = []
+            for base in bases:
+                if not os.path.isdir(base):
+                    continue
+                for root, _, files in os.walk(base):
+                    for fname in files:
+                        if fname == wanted_base:
+                            matches.append(os.path.abspath(os.path.join(root, fname)))
+            matches = sorted(set(matches))
+            if len(matches) == 1:
+                return matches[0]
+
+            if len(matches) > 1:
+                raise RuntimeError(
+                    f"--file '{args.file}' is ambiguous (found {len(matches)} matches). "
+                    f"Provide a path relative to repo root or an absolute path."
+                )
+
+            raise RuntimeError(
+                f"--file '{args.file}' not found. Provide a path relative to repo root (or src/), "
+                f"or an absolute path."
+            )
+
+        selected_file_abs = ""
+        if args.file:
+            selected_file_abs = _resolve_selected_file()
+            try:
+                rel_selected = os.path.relpath(selected_file_abs, args.repo_path)
+            except Exception:
+                rel_selected = selected_file_abs
+            print(f"[INFO] [DEBUG] Single-file target resolved to: {rel_selected}", flush=True)
+
+        # Find C++ files under the configured source directory (excluding tests/, build/, and CMakeFiles/ directories)
+        scan_root = os.path.join(args.repo_path, os.path.normpath(args.source_dir)) if args.source_dir else args.repo_path
+        if not os.path.isdir(scan_root):
+            if args.verbose:
+                print(f"[WARN] Source dir '{args.source_dir}' not found. Falling back to repo root scan.", flush=True)
+            scan_root = args.repo_path
+
         c_files = []
-        for root, dirs, files in os.walk(args.repo_path):
+        for root, dirs, files in os.walk(scan_root):
             for file in files:
                 if file.endswith('.cpp'):  # Process .cpp files only, not .c or headers
                     # Skip files in tests/, build/, CMakeFiles/, ai_test_build/ directories to avoid processing generated files
@@ -418,6 +538,13 @@ def main():
                         continue
                     c_files.append(os.path.join(root, file))
 
+        # If a specific file was requested, restrict the list now (so we don't print/process others)
+        if selected_file_abs:
+            # Basic sanity: only allow .cpp in this generator mode.
+            if not selected_file_abs.endswith('.cpp'):
+                raise RuntimeError(f"Selected file must be a .cpp file, got: {args.file}")
+            c_files = [selected_file_abs]
+
         if args.verbose:
             print(f"[INFO] Found {len(c_files)} C/C++ files to process")
 
@@ -427,9 +554,7 @@ def main():
             for file_path in c_files:
                 list_functions_for_file(file_path, args.repo_path, verbose=True)
 
-        # Create output directory
-        # For each file, tests will be placed in a 'tests' folder in the same directory as the source file
-        # We'll track all output directories for cleanup
+        # Track output directories where we actually write artifacts.
         output_dirs = set()
 
         # Clean up old verification and compilation reports (unless disabled)
@@ -441,7 +566,6 @@ def main():
                 for root, dirs, files in os.walk(args.repo_path):
                     if 'tests' in dirs:
                         tests_dir = os.path.join(root, 'tests')
-                        output_dirs.add(tests_dir)
                         if os.path.exists(tests_dir):
                             # Clean up report directories in each tests folder
                             for item in os.listdir(tests_dir):
@@ -499,11 +623,6 @@ def main():
         for file_path in c_files:
             rel_path = os.path.relpath(file_path, args.repo_path)
             print(f"[PROC] Processing: {rel_path}")
-            output_dirs.add(output_dir)
-
-            # Filter by specific file if requested
-            if args.file and os.path.basename(file_path) != args.file:
-                continue
 
             # Check if valid test already exists
             if args.skip_if_valid:
@@ -610,17 +729,20 @@ def main():
 
         # Print summary
         print(f"\n[DONE] [DONE] COMPLETED!")
-        print(f"   [PASS] [OK] Generated: {successful_generations}/{len(c_files)} files")
-        if output_dirs:
+        total_targets = len(c_files)
+        print(f"✅ [OK] Generated: {successful_generations}/{total_targets} file(s)")
+
+        # Only claim output locations when something was actually produced.
+        if successful_generations > 0 or validation_reports or generated_test_files:
             print(f"   [SAVE] [SAVE] Tests saved to:")
-            for output_dir in sorted(output_dirs):
-                rel_dir = os.path.relpath(output_dir, args.repo_path)
+            for out_dir in sorted(output_dirs):
+                rel_dir = os.path.relpath(out_dir, args.repo_path)
                 print(f"     - {rel_dir}")
             if validation_reports:
                 print(f"   [SAVE] [SAVE] Reports saved in respective test directories")
 
         if args.regenerate_on_low_quality:
-            print("[WARN] [WARN] Auto-regeneration is DISABLED by the mandatory human review gate.")
+            print("⚠️ [WARN] Auto-regeneration is DISABLED by the mandatory human review gate.")
 
         # Check quality of all generated tests
         quality_levels = {'low': 0, 'medium': 1, 'high': 2}
@@ -651,8 +773,8 @@ def main():
         if successful_generations == 0:
             print("[ERROR] [ERROR] No tests were successfully generated")
             sys.exit(1)
-        elif successful_generations < len(c_files):
-            print(f"[WARN] [WARN] {successful_generations}/{len(c_files)} files successfully generated tests - check validation reports")
+        elif successful_generations < total_targets:
+            print(f"[WARN] [WARN] {successful_generations}/{total_targets} file(s) successfully generated tests - check validation reports")
             print("[TIP] [INFO] Some files failed to generate tests (likely due to API timeouts or other issues)")
             # Don't exit with error - allow CI/CD to continue with partial success
 
@@ -738,17 +860,30 @@ def main():
             f.write("\n## Approval gate\n")
             f.write("Create an approval file for EACH generated test file before building or running tests:\n\n")
             if generated_rel:
-                f.write("Required approval files:\n")
+                review_dir_rel = os.path.relpath(review_dir, repo_root_abs).replace('\\', '/')
+                f.write("Required approval files (preferred; mirrors project structure under tests/):\n")
+                for p in generated_rel:
+                    # Preferred: strip leading tests/ so approvals mirror the repo layout directly.
+                    # Example: tests/src/app/Foo/test_Bar.cpp -> tests/review/src/app/Foo/test_Bar.cpp.flag
+                    p_norm = p.replace('\\', '/').lstrip('/')
+                    if p_norm.startswith('tests/'):
+                        p_norm = p_norm[len('tests/'):]
+                    f.write(f"- {review_dir_rel}/{p_norm}.flag\n")
+
+                f.write("\nAlso accepted (back-compat):\n")
+                for p in generated_rel:
+                    # Previous mirrored scheme kept the full repo-relative test path under review/.
+                    f.write(f"- {review_dir_rel}/{p}.flag\n")
                 for p in generated_rel:
                     approval_name = f"APPROVED.{os.path.basename(p)}.flag"
-                    f.write(f"- tests/review/{approval_name}\n")
+                    f.write(f"- {review_dir_rel}/{approval_name}\n")
                 f.write("\n")
             f.write("Each approval file contents must be exactly:\n\n")
             f.write("approved = true\n")
             f.write("reviewed_by = <human_name>\n")
             f.write("date = <ISO date>\n")
 
-        print("[DONE] [SUCCESS] Test generation completed!")
+        print("🎉 [SUCCESS] Test generation completed!")
         print(f"   [INFO] Review artifact written: {os.path.relpath(review_required_path, repo_root)}")
         print("⛔ Manual review required before build.")
         sys.exit(0)
